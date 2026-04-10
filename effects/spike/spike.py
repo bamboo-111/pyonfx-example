@@ -55,6 +55,10 @@ class MeltConfig:
     drawing_min_point_spacing: float = 0.75
     mask_min_piece_area: float = 0.2
     output_coord_precision: int = 2
+    line_base_blur: float = 0.0
+    line_dual_glow_enabled: bool = False
+    line_glow_outer_blur: float = 16.0
+    mask_piece_blur: float = 0.0
     merge_mask_bands_by_timing: bool = True
     spike_total_count: int = 32
     spike_min_count: int = 12
@@ -63,8 +67,31 @@ class MeltConfig:
     spike_travel_distance: float = 44.0
     spike_angle_range: float = 20.0
     spike_spawn_jitter: float = 0.3
-    spike_bound_margin: float = 3.0
+    spike_bound_margin: float = 18.0
     spike_early_start_ms: int = 300
+    spike_lifetime_min_ms: int = 100
+    spike_lifetime_max_ms: int = 800
+    spike_speed_min: float = 36.0
+    spike_speed_max: float = 175.0
+    spike_radial_speed: float = 14.0
+    spike_cone_half_angle: float = 25.0
+    spike_spherical_jitter: float = 0.1
+    spike_emit_peak_t: float = 0.29094324
+    spike_size_peak_t: float = 0.04815741
+    spike_alpha_peak_t: float = 20239 / 65535
+    spike_spawn_radius_factor: float = 0.38
+    spike_stretch_percent: int = 1600
+    spike_scale_x_min: float = 0.6
+    spike_scale_x_max: float = 1.0
+    spike_scale_y_min: float = 0.06
+    spike_scale_y_max: float = 0.12
+    spike_glow_enabled: bool = True
+    spike_glow_inner_scale: float = 1.18
+    spike_glow_outer_scale: float = 1.32
+    spike_glow_inner_blur: float = 2.0
+    spike_glow_outer_blur: float = 4.0
+    spike_glow_inner_alpha: str = "&H82&"
+    spike_glow_outer_alpha: str = "&HB8&"
     mask_preroll_ms: int = 80
     glyph_shake_duration_ms: int = 160
     glyph_shake_shift_px: float = 3.0
@@ -692,12 +719,35 @@ def _build_full_shape_events(
         highlight_color = _boost_ass_color(layer.color, config.line_highlight_strength)
         move_start = max(0, motion_start_abs - full_start)
         move_end = max(move_start + 1, min(full_end, motion_end_abs) - full_start)
+        base_blur = _format_ass_number(max(0.0, float(config.line_base_blur)))
+        glow_outer_blur = _format_ass_number(max(0.0, float(config.line_glow_outer_blur)))
+
+        if config.line_dual_glow_enabled:
+            outer_text = (
+                f"{{\\p1\\an7\\move({start_x},{start_y},{end_x},{end_y},{move_start},{move_end})\\1c{highlight_color}\\1a&HFF&"
+                f"\\blur{glow_outer_blur}\\fscx96\\fscy96"
+                f"\\t(0,{t_highlight},0.35,\\1a{target_alpha}\\blur{glow_outer_blur})"
+                f"\\t(0,{t_pop_end},0.5,\\fscx{pop_scale}\\fscy{pop_scale}\\1c{highlight_color})"
+                f"\\t({t_highlight},{t_settle_end},1.3,\\fscx100\\fscy100\\1c{layer.color}\\blur{glow_outer_blur})"
+                f"\\t({move_start},{move_end},\\frz{frz_text})"
+                f"}}{drawing}"
+            )
+            events.append(
+                OutputEvent(
+                    layer=line_layer_base + layer.layer_offset - 2,
+                    style=style_name,
+                    start_time=int(full_start),
+                    end_time=int(full_end),
+                    text=outer_text,
+                )
+            )
+
         text = (
             f"{{\\p1\\an7\\move({start_x},{start_y},{end_x},{end_y},{move_start},{move_end})\\1c{highlight_color}\\1a&HFF&"
-            f"\\blur1.6\\fscx96\\fscy96"
-            f"\\t(0,{t_highlight},0.35,\\1a{target_alpha}\\blur0.6)"
+            f"\\blur{base_blur}\\fscx96\\fscy96"
+            f"\\t(0,{t_highlight},0.35,\\1a{target_alpha}\\blur{base_blur})"
             f"\\t(0,{t_pop_end},0.5,\\fscx{pop_scale}\\fscy{pop_scale}\\1c{highlight_color})"
-            f"\\t({t_highlight},{t_settle_end},1.3,\\fscx100\\fscy100\\1c{layer.color}\\blur0)"
+            f"\\t({t_highlight},{t_settle_end},1.3,\\fscx100\\fscy100\\1c{layer.color}\\blur{base_blur})"
             f"\\t({move_start},{move_end},\\frz{frz_text})"
             f"}}{drawing}"
         )
@@ -771,6 +821,11 @@ def _build_vector_mask_events(
         output_coord_precision=config.output_coord_precision,
     )
     layer_alpha_pairs = [(layer, _fade_target_alpha(layer.alpha)) for layer in layers]
+    dissolve_blur = max(0.0, float(config.mask_piece_blur))
+    if config.line_dual_glow_enabled:
+        dissolve_blur = max(dissolve_blur, float(config.line_glow_outer_blur))
+    else:
+        dissolve_blur = max(dissolve_blur, float(config.line_base_blur))
     band_entries = _collapse_band_masks_by_timing(
         band_masks=band_masks,
         steps=steps,
@@ -804,6 +859,7 @@ def _build_vector_mask_events(
                 drawing_min_point_spacing=config.drawing_min_point_spacing,
                 mask_preroll_ms=mask_preroll_ms,
                 min_piece_area=config.mask_min_piece_area,
+                mask_piece_blur=dissolve_blur,
             )
             if event is not None:
                 events.append(event)
@@ -854,6 +910,7 @@ def _build_mask_piece_event(
     drawing_min_point_spacing: float,
     mask_preroll_ms: int,
     min_piece_area: float,
+    mask_piece_blur: float,
 ) -> OutputEvent | None:
     if piece.area <= max(0.0, min_piece_area):
         return None
@@ -863,7 +920,7 @@ def _build_mask_piece_event(
         return None
 
     text = (
-        f"{{\\p1{move_tag}\\1c{layer.color}\\1a&HFF&"
+        f"{{\\p1{move_tag}\\1c{layer.color}\\1a&HFF&\\blur{_format_ass_number(max(0.0, mask_piece_blur))}"
         f"{f'\\\\t(0,{mask_preroll_ms},\\\\1a{target_alpha})' if mask_preroll_ms > 0 else f'\\\\1a{target_alpha}'}"
         f"\\t({timing.t_fade_on},{timing.t_fade_off},\\1a&HFF&)}}{drawing}"
     )
@@ -986,9 +1043,8 @@ def _apply_preset_overrides(
 
 
 def _random_spike_color(rng: random.Random) -> str:
-    if rng.random() < (1.0 / 3.0):
-        return "&H000000&"
-    return f"&H0000{rng.randint(0, 255):02X}&"
+    red = int(round(rng.uniform(0.0, 229.0)))
+    return f"&H0000{red:02X}&"
 
 
 def _resolve_death_quantize_ms(config: MeltConfig) -> int:
@@ -1026,12 +1082,56 @@ def _sample_front_loaded_time(start_ms: int, span_ms: int, rng: random.Random, *
     return int(rng.uniform(bin_start, max(bin_start + 1.0, bin_end)))
 
 
+def _sample_triangular_emit_delay(span_ms: int, peak_t: float, rng: random.Random) -> int:
+    if span_ms <= 1:
+        return 0
+
+    peak = max(0.001, min(0.999, peak_t))
+    u = rng.random()
+    if u <= peak:
+        t = math.sqrt(u * peak)
+    else:
+        t = 1.0 - math.sqrt((1.0 - u) * (1.0 - peak))
+    return int(round(t * span_ms))
+
+
+def _sample_spike_velocity(
+    *,
+    base_angle_deg: float,
+    speed: float,
+    spherical_jitter: float,
+    rng: random.Random,
+) -> tuple[float, float, float]:
+    cone_x = math.sin(math.radians(base_angle_deg))
+    cone_y = -math.cos(math.radians(base_angle_deg))
+    sphere_angle = rng.uniform(-180.0, 180.0)
+    sphere_x = math.sin(math.radians(sphere_angle))
+    sphere_y = -math.cos(math.radians(sphere_angle))
+    mix = max(0.0, min(1.0, spherical_jitter))
+    vel_x = ((1.0 - mix) * cone_x) + (mix * sphere_x)
+    vel_y = ((1.0 - mix) * cone_y) + (mix * sphere_y)
+    length = math.hypot(vel_x, vel_y)
+    if length <= 0.0001:
+        vel_x, vel_y = 0.0, -1.0
+    else:
+        vel_x /= length
+        vel_y /= length
+    return vel_x * speed, vel_y * speed, math.degrees(math.atan2(vel_y, vel_x))
+
+
 def _format_ass_number(value: float) -> str:
     return f"{value:.4f}".rstrip("0").rstrip(".")
 
 
 def _format_ass_number_with_precision(value: float, precision: int) -> str:
     return f"{value:.{max(0, precision)}f}".rstrip("0").rstrip(".")
+
+
+def _normalize_ass_alpha(alpha: str, fallback: str) -> str:
+    raw = alpha.strip().upper()
+    if raw.startswith("&H") and raw.endswith("&") and len(raw) == 5:
+        return raw
+    return fallback
 
 
 def _build_motion_tag(
@@ -1212,22 +1312,189 @@ def _build_spike_events(
     config: MeltConfig,
     rng: random.Random,
 ) -> list[OutputEvent]:
-    if not unified:
-        return []
-
     syl_start, dissolve_start = _get_karaoke_syllable_times(line, syl)
     dissolve_end = dissolve_start + max(1, config.dissolve_duration)
     syl_left = float(syl.left)
     syl_top = float(syl.top)
     syl_width = max(1.0, float(getattr(syl, "width", 0.0) or 0.0))
     syl_height = max(1.0, float(getattr(syl, "height", 0.0) or 0.0))
+    center_x = syl_left + (syl_width * 0.5)
+    center_y = syl_top + (syl_height * 0.5)
+    spawn_radius = max(4.0, min(syl_width, syl_height) * max(0.05, config.spike_spawn_radius_factor))
     clamp_margin = max(0.0, config.spike_bound_margin)
     precision = max(0, int(config.output_coord_precision))
-    min_x = syl_left - clamp_margin
-    max_x = syl_left + syl_width + clamp_margin
-    min_y = syl_top - clamp_margin
-    max_y = syl_top + syl_height + clamp_margin
+    points = [(syl_left + px, syl_top + py) for px, py in unified] if unified else []
     events: list[OutputEvent] = []
+
+    def _emit_spike_cluster(
+        *,
+        emit_start: int,
+        emit_span: int,
+        count: int,
+        bound_margin: float,
+        cone_scale: float = 1.0,
+        travel_scale: float = 1.0,
+        radial_scale: float = 1.0,
+        lifetime_scale: float = 1.0,
+        spawn_radius_scale: float = 1.0,
+        blur: float = 1.0,
+        scale_y_boost: float = 1.0,
+    ) -> None:
+        if count <= 0:
+            return
+
+        bound_min_x = syl_left - bound_margin
+        bound_max_x = syl_left + syl_width + bound_margin
+        bound_min_y = syl_top - bound_margin
+        bound_max_y = syl_top + syl_height + bound_margin
+        local_emit_span = max(1, emit_span)
+
+        for _ in range(count):
+            if points and rng.random() < 0.2:
+                sx, sy = points[rng.randrange(len(points))]
+            else:
+                spawn_angle = rng.uniform(0.0, math.tau)
+                spawn_dist = math.sqrt(rng.random()) * spawn_radius * spawn_radius_scale
+                sx = center_x + (math.cos(spawn_angle) * spawn_dist)
+                sy = center_y + (math.sin(spawn_angle) * spawn_dist)
+
+            jitter = config.spike_spawn_jitter
+            sx += rng.uniform(-jitter, jitter)
+            sy += rng.uniform(-jitter, jitter)
+
+            birth_time = emit_start + _sample_triangular_emit_delay(
+                local_emit_span,
+                config.spike_emit_peak_t,
+                rng,
+            )
+
+            life_min = max(40, int(config.spike_lifetime_min_ms * lifetime_scale))
+            life_max = max(life_min, int(config.spike_lifetime_max_ms * lifetime_scale))
+            lifetime = int(rng.uniform(life_min, life_max))
+            death_time = int(birth_time + lifetime)
+
+            cone_half = max(1.0, config.spike_cone_half_angle * cone_scale)
+            base_angle = rng.uniform(-cone_half, cone_half)
+            speed = rng.uniform(config.spike_speed_min, config.spike_speed_max)
+            vel_x, vel_y, draw_angle = _sample_spike_velocity(
+                base_angle_deg=base_angle,
+                speed=speed,
+                spherical_jitter=config.spike_spherical_jitter,
+                rng=rng,
+            )
+
+            radial_dx = sx - center_x
+            radial_dy = sy - center_y
+            radial_len = math.hypot(radial_dx, radial_dy)
+            if radial_len > 0.0001:
+                vel_x += (radial_dx / radial_len) * config.spike_radial_speed * radial_scale
+                vel_y += (radial_dy / radial_len) * config.spike_radial_speed * radial_scale
+
+            # Aegisub uses the opposite sign convention for \frz, so keep the
+            # final screen-space movement angle here and negate only when writing tags.
+            draw_angle = math.degrees(math.atan2(vel_y, vel_x))
+            travel = lifetime * 0.001 * travel_scale
+            x2 = sx + (vel_x * travel)
+            y2 = sy + (vel_y * travel)
+            x2 = min(bound_max_x, max(bound_min_x, x2))
+            y2 = min(bound_max_y, max(bound_min_y, y2))
+
+            target_scale_y = rng.uniform(config.spike_scale_y_min, config.spike_scale_y_max) * scale_y_boost
+            target_scale_x = (
+                rng.uniform(config.spike_scale_x_min, config.spike_scale_x_max)
+                * max(1.0, config.spike_stretch_percent / 100.0)
+            )
+            start_scale_x = max(0.1, target_scale_x * 0.08)
+            start_scale_y = max(0.08, target_scale_y * 0.08)
+            size_peak_ms = max(1, int(lifetime * config.spike_size_peak_t))
+            alpha_peak_ms = max(1, int(lifetime * config.spike_alpha_peak_t))
+            spike_color = _random_spike_color(rng)
+            blur_text = _format_ass_number(blur)
+            start_tags = (
+                f"\\fscx{_format_ass_number(start_scale_x * 100.0)}"
+                f"\\fscy{_format_ass_number(start_scale_y * 100.0)}"
+                f"\\frz{_format_ass_number(-draw_angle)}"
+            )
+            target_scale_tags = (
+                f"\\fscx{_format_ass_number(target_scale_x * 100.0)}"
+                f"\\fscy{_format_ass_number(target_scale_y * 100.0)}"
+            )
+            move_tag = (
+                f"\\an5\\move({_format_ass_number_with_precision(sx, precision)},{_format_ass_number_with_precision(sy, precision)},"
+                f"{_format_ass_number_with_precision(x2, precision)},{_format_ass_number_with_precision(y2, precision)})"
+            )
+            glow_inner_alpha = _normalize_ass_alpha(config.spike_glow_inner_alpha, "&H78&")
+            glow_outer_alpha = _normalize_ass_alpha(config.spike_glow_outer_alpha, "&HAC&")
+
+            if config.spike_glow_enabled:
+                outer_start_tags = (
+                    f"\\fscx{_format_ass_number(start_scale_x * config.spike_glow_outer_scale * 100.0)}"
+                    f"\\fscy{_format_ass_number(start_scale_y * config.spike_glow_outer_scale * 100.0)}"
+                    f"\\frz{_format_ass_number(-draw_angle)}"
+                )
+                outer_target_tags = (
+                    f"\\fscx{_format_ass_number(target_scale_x * config.spike_glow_outer_scale * 100.0)}"
+                    f"\\fscy{_format_ass_number(target_scale_y * config.spike_glow_outer_scale * 100.0)}"
+                )
+                outer_text = (
+                    f"{{{move_tag}\\p1\\bord0\\shad0\\blur{_format_ass_number(config.spike_glow_outer_blur)}"
+                    f"\\1c{spike_color}\\alpha&HFF&{outer_start_tags}"
+                    f"\\t(0,{size_peak_ms},{outer_target_tags})"
+                    f"\\t(0,{alpha_peak_ms},\\alpha{glow_outer_alpha})"
+                    f"\\t({alpha_peak_ms},{lifetime},\\alpha&HFF&)}}{SPIKE_BASE_DRAWING}"
+                )
+                events.append(
+                    OutputEvent(
+                        layer=line_layer_base,
+                        style=style_name,
+                        start_time=birth_time,
+                        end_time=death_time,
+                        text=outer_text,
+                    )
+                )
+
+                inner_start_tags = (
+                    f"\\fscx{_format_ass_number(start_scale_x * config.spike_glow_inner_scale * 100.0)}"
+                    f"\\fscy{_format_ass_number(start_scale_y * config.spike_glow_inner_scale * 100.0)}"
+                    f"\\frz{_format_ass_number(-draw_angle)}"
+                )
+                inner_target_tags = (
+                    f"\\fscx{_format_ass_number(target_scale_x * config.spike_glow_inner_scale * 100.0)}"
+                    f"\\fscy{_format_ass_number(target_scale_y * config.spike_glow_inner_scale * 100.0)}"
+                )
+                inner_text = (
+                    f"{{{move_tag}\\p1\\bord0\\shad0\\blur{_format_ass_number(config.spike_glow_inner_blur)}"
+                    f"\\1c{spike_color}\\alpha&HFF&{inner_start_tags}"
+                    f"\\t(0,{size_peak_ms},{inner_target_tags})"
+                    f"\\t(0,{alpha_peak_ms},\\alpha{glow_inner_alpha})"
+                    f"\\t({alpha_peak_ms},{lifetime},\\alpha&HFF&)}}{SPIKE_BASE_DRAWING}"
+                )
+                events.append(
+                    OutputEvent(
+                        layer=line_layer_base + 1,
+                        style=style_name,
+                        start_time=birth_time,
+                        end_time=death_time,
+                        text=inner_text,
+                    )
+                )
+
+            text = (
+                f"{{{move_tag}\\p1\\bord0\\shad0\\blur{blur_text}\\1c{spike_color}\\alpha&HFF&{start_tags}"
+                f"\\t(0,{size_peak_ms},{target_scale_tags})"
+                f"\\t(0,{alpha_peak_ms},\\alpha&H00&)"
+                f"\\t({alpha_peak_ms},{lifetime},\\alpha&HFF&)}}{SPIKE_BASE_DRAWING}"
+            )
+            events.append(
+                OutputEvent(
+                    layer=line_layer_base + 2,
+                    style=style_name,
+                    start_time=birth_time,
+                    end_time=death_time,
+                    text=text,
+                )
+            )
+
     regular_emit_start = max(syl_start, dissolve_start - max(0, config.spike_early_start_ms))
     regular_emit_end = dissolve_start + int(config.dissolve_duration * 0.65)
     regular_emit_span = max(1, regular_emit_end - regular_emit_start)
@@ -1237,55 +1504,12 @@ def _build_spike_events(
         config.spike_total_count,
     )
     regular_count = max(max(0, config.spike_min_count), regular_count)
-
-    for _ in range(regular_count):
-        sample_x, sample_y = unified[rng.randrange(len(unified))]
-        jitter = config.spike_spawn_jitter
-        sx = sample_x + rng.uniform(-jitter, jitter)
-        sy = sample_y + rng.uniform(-jitter, jitter)
-
-        birth_time = _sample_front_loaded_time(regular_emit_start, regular_emit_span, rng)
-        death_time = int(birth_time + config.spike_lifetime_ms)
-
-        angle_deg = rng.uniform(-config.spike_angle_range, config.spike_angle_range)
-        angle_rad = math.radians(angle_deg)
-        size_jitter_x = rng.uniform(0.8, 1.2)
-        size_jitter_y = rng.uniform(0.8, 1.2)
-        travel_jitter = rng.uniform(0.8, 1.2)
-        scale_x = rng.uniform(0.75, 1.15) * size_jitter_x
-        scale_y = rng.uniform(0.8, 1.35) * size_jitter_y
-        spike_tags = _get_cached_spike_tags(angle_deg, scale_x, scale_y, config)
-
-        dx = math.sin(angle_rad)
-        dy = -math.cos(angle_rad)
-        x1 = syl_left + sx
-        y1 = syl_top + sy
-        travel = config.spike_travel_distance * travel_jitter
-        x2 = x1 + dx * travel
-        y2 = y1 + dy * travel
-        x2 = min(max_x, max(min_x, x2))
-        y2 = min(max_y, max(min_y, y2))
-
-        lifetime = config.spike_lifetime_ms
-        fade_in_end = int(lifetime * 0.25)
-        fade_out_start = int(lifetime * 0.75)
-        spike_color = _random_spike_color(rng)
-        text = (
-            f"{{\\an5\\move({_format_ass_number_with_precision(x1, precision)},{_format_ass_number_with_precision(y1, precision)},"
-            f"{_format_ass_number_with_precision(x2, precision)},{_format_ass_number_with_precision(y2, precision)})"
-            f"\\p1\\bord0\\shad0\\blur1\\1c{spike_color}\\alpha&HFF&{spike_tags}"
-            f"\\t(0,{fade_in_end},\\alpha&H00&)"
-            f"\\t({fade_out_start},{lifetime},\\alpha&HFF&)}}{SPIKE_BASE_DRAWING}"
-        )
-        events.append(
-            OutputEvent(
-                layer=line_layer_base + 2,
-                style=style_name,
-                start_time=birth_time,
-                end_time=death_time,
-                text=text,
-            )
-        )
+    _emit_spike_cluster(
+        emit_start=regular_emit_start,
+        emit_span=regular_emit_span,
+        count=regular_count,
+        bound_margin=clamp_margin,
+    )
 
     burst_window = max(20, config.predissolve_spike_window_ms)
     predissolve_count = _resolve_count_by_rate(
@@ -1298,77 +1522,21 @@ def _build_spike_events(
     if predissolve_count > 0:
         burst_advance = max(0, config.predissolve_spike_start_advance_ms)
         burst_start = max(syl_start, dissolve_end - burst_window - burst_advance)
-        burst_margin = clamp_margin + max(0.0, config.predissolve_spike_bound_extra)
-        burst_min_x = syl_left - burst_margin
-        burst_max_x = syl_left + syl_width + burst_margin
-        burst_min_y = syl_top - burst_margin
-        burst_max_y = syl_top + syl_height + burst_margin
-
-        for _ in range(predissolve_count):
-            sample_x, sample_y = unified[rng.randrange(len(unified))]
-            jitter = config.spike_spawn_jitter * 0.65
-            sx = sample_x + rng.uniform(-jitter, jitter)
-            sy = sample_y + rng.uniform(-jitter, jitter)
-
-            burst_end = max(burst_start + 1, dissolve_end - 10)
-            burst_span = max(1, burst_end - burst_start)
-            birth_time = _sample_front_loaded_time(burst_start, burst_span, rng)
-            lifetime = max(120, config.predissolve_spike_lifetime_ms)
-            death_time = int(birth_time + lifetime)
-
-            burst_angle_range = max(
-                config.spike_angle_range + 4.0,
-                config.spike_angle_range * max(1.0, config.predissolve_spike_angle_multiplier),
-            )
-            angle_deg = rng.uniform(-burst_angle_range, burst_angle_range)
-            angle_rad = math.radians(angle_deg)
-
-            travel_jitter = rng.uniform(0.8, 1.2)
-            travel = (
-                config.spike_travel_distance
-                * max(1.0, config.predissolve_spike_travel_multiplier)
-                * travel_jitter
-            )
-            dx = math.sin(angle_rad)
-            dy = -math.cos(angle_rad)
-            x1 = syl_left + sx
-            y1 = syl_top + sy
-            x2 = x1 + dx * travel
-            y2 = y1 + dy * travel * 1.4
-            x2 = min(burst_max_x, max(burst_min_x, x2))
-            y2 = min(burst_max_y, max(burst_min_y, y2))
-
-            size_jitter_x = rng.uniform(0.8, 1.2)
-            size_jitter_y = rng.uniform(0.8, 1.2)
-            accel = max(0.1, config.predissolve_spike_accel * rng.uniform(0.8, 1.2))
-            accel_text = _format_ass_number(accel)
-            base_x = rng.uniform(0.85, 1.05) * config.predissolve_spike_scale_x * size_jitter_x
-            base_y = rng.uniform(1.05, 1.4) * config.predissolve_spike_scale_y * size_jitter_y
-            spike_tags = _get_cached_spike_tags(angle_deg, base_x, base_y, config)
-
-            fade_in_end = int(lifetime * 0.22)
-            sharpen_end = int(lifetime * 0.40)
-            morph_end = int(lifetime * 0.82)
-            fade_out_start = int(lifetime * 0.72)
-            spike_color = _random_spike_color(rng)
-            text = (
-                f"{{\\an5\\move({_format_ass_number_with_precision(x1, precision)},{_format_ass_number_with_precision(y1, precision)},"
-                f"{_format_ass_number_with_precision(x2, precision)},{_format_ass_number_with_precision(y2, precision)})"
-                f"\\p1\\bord0\\shad0\\blur0.6\\1c{spike_color}\\alpha&HFF&{spike_tags}"
-                f"\\t(0,{fade_in_end},\\alpha&H00&)"
-                f"\\t(0,{sharpen_end},1.2,\\fscx{_format_ass_number(base_x * 102)}\\fscy{_format_ass_number(base_y * 108)})"
-                f"\\t({sharpen_end},{morph_end},{accel_text},\\fscx{_format_ass_number(base_x * 82)}\\fscy{_format_ass_number(base_y * 145)}\\blur0.25)"
-                f"\\t({fade_out_start},{lifetime},\\alpha&HFF&)}}{SPIKE_BASE_DRAWING}"
-            )
-            events.append(
-                OutputEvent(
-                    layer=line_layer_base + 2,
-                    style=style_name,
-                    start_time=birth_time,
-                    end_time=death_time,
-                    text=text,
-                )
-            )
+        burst_end = max(burst_start + 1, dissolve_end - 10)
+        burst_span = max(1, burst_end - burst_start)
+        _emit_spike_cluster(
+            emit_start=burst_start,
+            emit_span=burst_span,
+            count=predissolve_count,
+            bound_margin=clamp_margin + max(0.0, config.predissolve_spike_bound_extra),
+            cone_scale=max(1.0, config.predissolve_spike_angle_multiplier),
+            travel_scale=max(1.0, config.predissolve_spike_travel_multiplier),
+            radial_scale=max(1.0, config.predissolve_spike_accel * 0.55),
+            lifetime_scale=max(0.4, config.predissolve_spike_lifetime_ms / max(1, config.spike_lifetime_max_ms)),
+            spawn_radius_scale=1.2,
+            blur=0.6,
+            scale_y_boost=max(1.0, config.predissolve_spike_scale_y),
+        )
 
     return events
 
@@ -1505,9 +1673,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-original", type=_parse_bool_arg, default=True, help="Whether to comment and preserve original dialogue lines.")
     parser.add_argument("--extended", type=_parse_bool_arg, default=True, help="Whether Ass should compute extended line data.")
     parser.add_argument("--quality-preset", default=None, choices=("quality", "balanced", "speed"), help="High-level quality/speed preset.")
+    parser.add_argument(
+        "--line-dual-glow",
+        dest="line_dual_glow_enabled",
+        action="store_true",
+        default=None,
+        help="Enable dual glow for base subtitle layers.",
+    )
+    parser.add_argument(
+        "--no-line-dual-glow",
+        dest="line_dual_glow_enabled",
+        action="store_false",
+        help="Disable dual glow for base subtitle layers.",
+    )
 
     for config_field in fields(MeltConfig):
-        if config_field.name == "quality_preset":
+        if config_field.name in {"quality_preset", "line_dual_glow_enabled"}:
             continue
         parser.add_argument(
             f"--{config_field.name.replace('_', '-')}",
