@@ -69,6 +69,7 @@ class MeltConfig:
     spike_spawn_jitter: float = 0.3
     spike_bound_margin: float = 18.0
     spike_early_start_ms: int = 300
+    spike_lead_ms: int = 70
     spike_lifetime_min_ms: int = 40
     spike_lifetime_max_ms: int = 600
     spike_speed_min: float = 36.0
@@ -101,7 +102,7 @@ class MeltConfig:
     predissolve_spike_count: int = 8
     predissolve_spike_min_count: int = 4
     predissolve_spike_count_per_100ms: float = 2.7
-    predissolve_spike_lifetime_ms: int = 220
+    predissolve_spike_lifetime_ms: int = 360
     predissolve_spike_accel: float = 2.2
     predissolve_spike_travel_multiplier: float = 1.9
     predissolve_spike_angle_multiplier: float = 1.35
@@ -1499,8 +1500,12 @@ def _build_spike_events(
                 )
             )
 
-    regular_emit_start = max(syl_start, dissolve_start - max(0, config.spike_early_start_ms))
-    regular_emit_end = dissolve_start + int(config.dissolve_duration * 0.65)
+    spike_lead_ms = max(0, config.spike_lead_ms)
+    regular_emit_start = max(syl_start, dissolve_start - max(0, config.spike_early_start_ms) - spike_lead_ms)
+    regular_emit_end = max(
+        regular_emit_start + 1,
+        dissolve_start - spike_lead_ms + int(config.dissolve_duration * 0.65),
+    )
     regular_emit_span = max(1, regular_emit_end - regular_emit_start)
     regular_count = _resolve_count_by_rate(
         regular_emit_span,
@@ -1525,8 +1530,8 @@ def _build_spike_events(
 
     if predissolve_count > 0:
         burst_advance = max(0, config.predissolve_spike_start_advance_ms)
-        burst_start = max(syl_start, dissolve_end - burst_window - burst_advance)
-        burst_end = max(burst_start + 1, dissolve_end - 10)
+        burst_start = max(syl_start, dissolve_end - burst_window - burst_advance - spike_lead_ms)
+        burst_end = burst_start + burst_window
         burst_span = max(1, burst_end - burst_start)
         _emit_spike_cluster(
             emit_start=burst_start,
@@ -1536,7 +1541,7 @@ def _build_spike_events(
             cone_scale=max(1.0, config.predissolve_spike_angle_multiplier),
             travel_scale=max(1.0, config.predissolve_spike_travel_multiplier),
             radial_scale=max(1.0, config.predissolve_spike_accel * 0.55),
-            lifetime_scale=max(0.4, config.predissolve_spike_lifetime_ms / max(1, config.spike_lifetime_max_ms)),
+            lifetime_scale=max(0.7, config.predissolve_spike_lifetime_ms / max(1, config.spike_lifetime_max_ms)),
             spawn_radius_scale=1.2,
             blur=0.6,
             scale_y_boost=max(1.0, config.predissolve_spike_scale_y),
