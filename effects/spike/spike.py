@@ -42,7 +42,7 @@ class MeltConfig:
     mask_noise_octaves: int = 4
     mask_noise_scale: float = 3.4
     mask_noise_simplify: float = 0.0
-    line_lead_in_ms: int = 520
+    line_lead_in_ms: int = 320
     line_fade_in_ms: int = 90
     line_highlight_ms: int = 70
     line_pop_ms: int = 140
@@ -56,21 +56,21 @@ class MeltConfig:
     mask_min_piece_area: float = 0.2
     output_coord_precision: int = 2
     line_base_blur: float = 0.0
-    line_dual_glow_enabled: bool = False
+    line_dual_glow_enabled: bool = True
     line_glow_outer_blur: float = 16.0
     mask_piece_blur: float = 0.0
     merge_mask_bands_by_timing: bool = True
     spike_total_count: int = 32
     spike_min_count: int = 12
     spike_count_per_100ms: float = 3.2
-    spike_lifetime_ms: int = 500
+    spike_lifetime_ms: int = 300
     spike_travel_distance: float = 44.0
     spike_angle_range: float = 20.0
     spike_spawn_jitter: float = 0.3
     spike_bound_margin: float = 18.0
     spike_early_start_ms: int = 300
-    spike_lifetime_min_ms: int = 100
-    spike_lifetime_max_ms: int = 800
+    spike_lifetime_min_ms: int = 40
+    spike_lifetime_max_ms: int = 600
     spike_speed_min: float = 36.0
     spike_speed_max: float = 175.0
     spike_radial_speed: float = 14.0
@@ -101,7 +101,7 @@ class MeltConfig:
     predissolve_spike_count: int = 8
     predissolve_spike_min_count: int = 4
     predissolve_spike_count_per_100ms: float = 2.7
-    predissolve_spike_lifetime_ms: int = 420
+    predissolve_spike_lifetime_ms: int = 220
     predissolve_spike_accel: float = 2.2
     predissolve_spike_travel_multiplier: float = 1.9
     predissolve_spike_angle_multiplier: float = 1.35
@@ -821,11 +821,10 @@ def _build_vector_mask_events(
         output_coord_precision=config.output_coord_precision,
     )
     layer_alpha_pairs = [(layer, _fade_target_alpha(layer.alpha)) for layer in layers]
-    dissolve_blur = max(0.0, float(config.mask_piece_blur))
-    if config.line_dual_glow_enabled:
-        dissolve_blur = max(dissolve_blur, float(config.line_glow_outer_blur))
-    else:
-        dissolve_blur = max(dissolve_blur, float(config.line_base_blur))
+    dissolve_blur = max(
+        max(0.0, float(config.mask_piece_blur)),
+        max(0.0, float(config.line_base_blur)),
+    )
     band_entries = _collapse_band_masks_by_timing(
         band_masks=band_masks,
         steps=steps,
@@ -919,9 +918,14 @@ def _build_mask_piece_event(
     if not drawing:
         return None
 
+    fade_in_tag = (
+        f"\\t(0,{mask_preroll_ms},\\1a{target_alpha})"
+        if mask_preroll_ms > 0
+        else f"\\1a{target_alpha}"
+    )
     text = (
         f"{{\\p1{move_tag}\\1c{layer.color}\\1a&HFF&\\blur{_format_ass_number(max(0.0, mask_piece_blur))}"
-        f"{f'\\\\t(0,{mask_preroll_ms},\\\\1a{target_alpha})' if mask_preroll_ms > 0 else f'\\\\1a{target_alpha}'}"
+        f"{fade_in_tag}"
         f"\\t({timing.t_fade_on},{timing.t_fade_off},\\1a&HFF&)}}{drawing}"
     )
     return OutputEvent(
