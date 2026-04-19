@@ -7,6 +7,7 @@ import math
 import multiprocessing as mp
 import os
 import random
+import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, fields, replace
@@ -27,7 +28,18 @@ SPIKE_BASE_CENTERED = Shape(SPIKE_BASE.drawing_cmds)
 SPIKE_BASE_CENTERED.align(an=5)
 SPIKE_BASE_DRAWING = str(SPIKE_BASE_CENTERED)
 _SPIKE_TAG_CACHE: dict[tuple[float, float, float], str] = {}
-_NOISE_MASK_LIBRARY_CACHE: dict[tuple[int, int, int, int, float, int], list[list[MultiPolygon]]] = {}
+_NOISE_MASK_LIBRARY_CACHE: dict[tuple, list[list[MultiPolygon]]] = {}
+_POS_RE = re.compile(r'\\pos\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)')
+
+
+def _compute_line_pos_offset(line) -> tuple[float, float]:
+    text = getattr(line, 'text', '') or ''
+    match = _POS_RE.search(text)
+    if not match:
+        return 0.0, 0.0
+    pos_x = float(match.group(1))
+    pos_y = float(match.group(2))
+    return pos_x - line.x, pos_y - line.y
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,8 +60,10 @@ class MeltConfig:
     line_pop_ms: int = 140
     line_pop_scale_percent: int = 120
     line_highlight_strength: float = 0.42
-    syllable_stagger_ms: int = 80
+    syllable_stagger_ms: int = 40
     dissolve_duration: int = 1000
+    dissolve_start_frac: float = 0.0
+    dissolve_end_frac: float = 1
     pixel_fade_ms: int = 180
     death_quantize_ms: int = 10
     drawing_min_point_spacing: float = 0.75
@@ -115,6 +129,7 @@ class MeltConfig:
     multiprocessing_min_lines: int = 6
     max_workers: int = 0
     random_seed: int = 24681357
+    mask_noise_type: str = "worley"
     quality_preset: str = "quality"
     compression_preset: str = "none"
 
@@ -532,6 +547,45 @@ def _fbm_noise_2d(x: float, y: float, seed: int, octaves: int) -> float:
     return total / norm
 
 
+def _worley_noise_2d(x: float, y: float, seed: int, point_density: int = 4) -> float:
+    """Worley (cellular) noise: returns distance to nearest random feature point."""
+    cell_x = math.floor(x)
+    cell_y = math.floor(y)
+    min_dist = float("inf")
+
+    for dx in range(-1, 2):
+        for dy in range(-1, 2):
+            nx = cell_x + dx
+            ny = cell_y + dy
+            # Generate feature points in this cell using hash
+            for p in range(point_density):
+                h = ((nx * 1836311903) ^ (ny * 2971215073) ^ (seed * 4807526976) ^ (p * 16777619)) & 0xFFFFFFFF
+                px = nx + ((h & 0xFFFF) / 0xFFFF)
+                py = ny + (((h >> 16) & 0xFFFF) / 0xFFFF)
+                dist = math.hypot(x - px, y - py)
+                if dist < min_dist:
+                    min_dist = dist
+
+    return min_dist
+
+
+def _fbm_worley_2d(x: float, y: float, seed: int, octaves: int) -> float:
+    total = 0.0
+    amplitude = 1.0
+    frequency = 1.0
+    norm = 0.0
+
+    for octave in range(max(1, octaves)):
+        total += _worley_noise_2d(x * frequency, y * frequency, seed + octave * 1013) * amplitude
+        norm += amplitude
+        amplitude *= 0.5
+        frequency *= 2.0
+
+    if norm <= 0.0:
+        return 0.0
+    return total / norm
+
+
 def _generate_noise_mask_template(
     *,
     steps: int,
@@ -540,10 +594,12 @@ def _generate_noise_mask_template(
     scale: float,
     simplify_tolerance: float,
     seed: int,
+    noise_type: str = "perlin",
 ) -> list[MultiPolygon]:
     grid = max(6, resolution)
     cell_size = 1.0 / grid
     cells: list[tuple[float, Polygon]] = []
+    noise_fn = _fbm_worley_2d if noise_type == "worley" else _fbm_noise_2d
 
     for row in range(grid):
         for col in range(grid):
@@ -553,7 +609,7 @@ def _generate_noise_mask_template(
             y1 = y0 + cell_size
             sample_x = ((col + 0.5) / grid) * scale
             sample_y = ((row + 0.5) / grid) * scale
-            value = _fbm_noise_2d(sample_x, sample_y, seed, octaves)
+            value = noise_fn(sample_x, sample_y, seed, octaves)
             cells.append((value, Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])))
 
     if not cells:
@@ -580,6 +636,7 @@ def _generate_noise_mask_template(
 
 
 def _get_noise_mask_library(config: MeltConfig, steps: int) -> list[list[MultiPolygon]]:
+    noise_type = config.mask_noise_type.strip().lower()
     cache_key = (
         max(1, steps),
         max(1, config.mask_library_size),
@@ -588,6 +645,7 @@ def _get_noise_mask_library(config: MeltConfig, steps: int) -> list[list[MultiPo
         float(config.mask_noise_scale),
         int(round(config.mask_noise_simplify * 1000.0)),
         int(config.random_seed),
+        noise_type,
     )
     cached = _NOISE_MASK_LIBRARY_CACHE.get(cache_key)
     if cached is not None:
@@ -604,6 +662,7 @@ def _get_noise_mask_library(config: MeltConfig, steps: int) -> list[list[MultiPo
             scale=max(0.1, config.mask_noise_scale),
             simplify_tolerance=max(0.0, config.mask_noise_simplify),
             seed=seed,
+            noise_type=noise_type,
         )
         if template:
             library.append(template)
@@ -658,6 +717,35 @@ def _get_karaoke_syllable_times(line, syl) -> tuple[int, int]:
     return int(line.start_time + syl.start_time), int(line.start_time + syl.end_time)
 
 
+def _resolve_dissolve_window(
+    line,
+    syl,
+    config: MeltConfig,
+    *,
+    is_last_syl: bool,
+) -> tuple[int, int, int]:
+    syl_start, syl_end = _get_karaoke_syllable_times(line, syl)
+    karaoke_dur = max(1, syl_end - syl_start)
+    if is_last_syl:
+        base_start = syl_start
+        adaptive_dissolve = karaoke_dur + max(config.dissolve_duration, int(karaoke_dur * 0.5))
+    else:
+        base_start = syl_end
+        adaptive_dissolve = max(config.dissolve_duration, int(karaoke_dur * 0.5))
+
+    start_frac = max(0.0, min(1.0, float(config.dissolve_start_frac)))
+    end_frac = max(0.0, min(1.0, float(config.dissolve_end_frac)))
+    if end_frac < start_frac:
+        end_frac = start_frac
+
+    dissolve_start = base_start + int(adaptive_dissolve * start_frac)
+    dissolve_end = base_start + int(adaptive_dissolve * end_frac)
+    if dissolve_end <= dissolve_start:
+        dissolve_end = dissolve_start + 1
+
+    return dissolve_start, dissolve_end, adaptive_dissolve
+
+
 def _get_glyph_motion_profile(line, syl, config: MeltConfig) -> tuple[int, int, float, float, float]:
     dissolve_start = int(line.start_time + syl.end_time)
     base_shift = max(0.0, config.glyph_shake_shift_px)
@@ -680,6 +768,7 @@ def _build_full_shape_events(
     line_layer_base: int,
     style_name: str,
     config: MeltConfig,
+    is_last_syl: bool = False,
 ) -> list[OutputEvent]:
     if not layers:
         return []
@@ -690,12 +779,17 @@ def _build_full_shape_events(
     pop_ms = max(1, config.line_pop_ms)
     pop_scale = max(100, int(config.line_pop_scale_percent))
     syl_start, _ = _get_adjusted_syllable_times(line, syl, config)
-    _, dissolve_anchor = _get_karaoke_syllable_times(line, syl)
+    dissolve_start, _, _ = _resolve_dissolve_window(
+        line=line,
+        syl=syl,
+        config=config,
+        is_last_syl=is_last_syl,
+    )
     motion_start_abs, motion_end_abs, motion_dx, motion_dy, motion_frz = _get_glyph_motion_profile(
         line, syl, config
     )
     full_start = max(0, syl_start - lead_in_ms)
-    full_end = max(full_start + 1, dissolve_anchor)
+    full_end = max(full_start + 1, dissolve_start)
     syl_left, syl_top = _syl_origin(syl)
     precision = max(0, int(config.output_coord_precision))
     start_x = _format_ass_number_with_precision(syl_left, precision)
@@ -791,19 +885,25 @@ def _build_vector_mask_events(
     style_name: str,
     config: MeltConfig,
     rng: random.Random,
+    is_last_syl: bool = False,
 ) -> list[OutputEvent]:
     if not layers:
         return []
 
     bounds = layers[0].multipolygon.bounds
     steps = _resolve_effective_mask_steps(bounds, config)
-    syl_start, dissolve_anchor = _get_karaoke_syllable_times(line, syl)
+    syl_start, _ = _get_karaoke_syllable_times(line, syl)
     motion_start_abs, motion_end_abs, motion_dx, motion_dy, motion_frz = _get_glyph_motion_profile(
         line, syl, config
     )
-    dissolve_start = dissolve_anchor
+    dissolve_start, dissolve_end, _ = _resolve_dissolve_window(
+        line=line,
+        syl=syl,
+        config=config,
+        is_last_syl=is_last_syl,
+    )
     event_start = max(syl_start, dissolve_start - max(0, config.mask_preroll_ms))
-    effective_window = max(1, config.dissolve_duration - config.pixel_fade_ms)
+    effective_window = max(1, (dissolve_end - dissolve_start) - config.pixel_fade_ms)
     death_quantize_ms = _resolve_death_quantize_ms(config)
     mask_preroll_ms = max(0, config.mask_preroll_ms)
     pattern_idx = rng.randrange(7)
@@ -837,10 +937,12 @@ def _build_vector_mask_events(
         merge_by_timing=config.merge_mask_bands_by_timing,
     )
 
-    for band_mask, timing in band_entries:
+    total_bands = max(1, len(band_entries))
+    for band_idx, (band_mask, timing) in enumerate(band_entries):
         if band_mask.is_empty:
             continue
 
+        band_frac = band_idx / max(1, total_bands - 1)
         band_bounds = band_mask.bounds
         for layer, target_alpha in layer_alpha_pairs:
             piece = _clip_layer_to_band(layer, band_mask, band_bounds)
@@ -860,6 +962,7 @@ def _build_vector_mask_events(
                 mask_preroll_ms=mask_preroll_ms,
                 min_piece_area=config.mask_min_piece_area,
                 mask_piece_blur=dissolve_blur,
+                band_frac=band_frac,
             )
             if event is not None:
                 events.append(event)
@@ -911,6 +1014,7 @@ def _build_mask_piece_event(
     mask_preroll_ms: int,
     min_piece_area: float,
     mask_piece_blur: float,
+    band_frac: float = 0.0,
 ) -> OutputEvent | None:
     if piece.area <= max(0.0, min_piece_area):
         return None
@@ -918,6 +1022,10 @@ def _build_mask_piece_event(
     drawing = _shape_to_ass_drawing(piece, drawing_min_point_spacing)
     if not drawing:
         return None
+
+    # Compute intermediate alpha: early bands stay opaque, later bands pre-fade
+    mid_alpha_int = int(round(255 * band_frac))
+    mid_alpha = f"&H{mid_alpha_int:02X}&"
 
     fade_in_tag = (
         f"\\t(0,{mask_preroll_ms},\\1a{target_alpha})"
@@ -927,6 +1035,7 @@ def _build_mask_piece_event(
     text = (
         f"{{\\p1{move_tag}\\1c{layer.color}\\1a&HFF&\\blur{_format_ass_number(max(0.0, mask_piece_blur))}"
         f"{fade_in_tag}"
+        f"\\t({mask_preroll_ms},{timing.t_fade_on},\\1a{mid_alpha})"
         f"\\t({timing.t_fade_on},{timing.t_fade_off},\\1a&HFF&)}}{drawing}"
     )
     return OutputEvent(
@@ -1316,9 +1425,15 @@ def _build_spike_events(
     style_name: str,
     config: MeltConfig,
     rng: random.Random,
+    is_last_syl: bool = False,
 ) -> list[OutputEvent]:
-    syl_start, dissolve_start = _get_karaoke_syllable_times(line, syl)
-    dissolve_end = dissolve_start + max(1, config.dissolve_duration)
+    actual_dissolve_start, actual_dissolve_end, _ = _resolve_dissolve_window(
+        line=line,
+        syl=syl,
+        config=config,
+        is_last_syl=is_last_syl,
+    )
+    dissolve_span = max(1, actual_dissolve_end - actual_dissolve_start)
     syl_left = float(syl.left)
     syl_top = float(syl.top)
     syl_width = max(1.0, float(getattr(syl, "width", 0.0) or 0.0))
@@ -1500,12 +1615,8 @@ def _build_spike_events(
                 )
             )
 
-    spike_lead_ms = max(0, config.spike_lead_ms)
-    regular_emit_start = max(syl_start, dissolve_start - max(0, config.spike_early_start_ms) - spike_lead_ms)
-    regular_emit_end = max(
-        regular_emit_start + 1,
-        dissolve_start - spike_lead_ms + int(config.dissolve_duration * 0.65),
-    )
+    regular_emit_start = actual_dissolve_start
+    regular_emit_end = min(actual_dissolve_end, actual_dissolve_start + int(dissolve_span * 0.8))
     regular_emit_span = max(1, regular_emit_end - regular_emit_start)
     regular_count = _resolve_count_by_rate(
         regular_emit_span,
@@ -1520,7 +1631,7 @@ def _build_spike_events(
         bound_margin=clamp_margin,
     )
 
-    burst_window = max(20, config.predissolve_spike_window_ms)
+    burst_window = max(20, int(dissolve_span * 0.3))
     predissolve_count = _resolve_count_by_rate(
         burst_window,
         config.predissolve_spike_count_per_100ms,
@@ -1529,9 +1640,8 @@ def _build_spike_events(
     predissolve_count = max(max(0, config.predissolve_spike_min_count), predissolve_count)
 
     if predissolve_count > 0:
-        burst_advance = max(0, config.predissolve_spike_start_advance_ms)
-        burst_start = max(syl_start, dissolve_end - burst_window - burst_advance - spike_lead_ms)
-        burst_end = burst_start + burst_window
+        burst_start = actual_dissolve_start
+        burst_end = min(actual_dissolve_end, actual_dissolve_start + burst_window)
         burst_span = max(1, burst_end - burst_start)
         _emit_spike_cluster(
             emit_start=burst_start,
@@ -1556,12 +1666,19 @@ def melt_line(
     config: MeltConfig,
     seed: int,
     style_name: str = "p",
+    y_offset: float = 0.0,
 ) -> list[OutputEvent]:
     rng = random.Random(seed)
     events: list[OutputEvent] = []
-    syllables = Utils.all_non_empty(line.syls, progress_bar=False)
+    syllables = list(Utils.all_non_empty(line.syls, progress_bar=False))
+    pos_dx, pos_dy = _compute_line_pos_offset(line)
+    pos_dy += y_offset
 
-    for syl in syllables:
+    for idx, syl in enumerate(syllables):
+        is_last_syl = (idx == len(syllables) - 1)
+        if pos_dx != 0.0 or pos_dy != 0.0:
+            syl.left += pos_dx
+            syl.top += pos_dy
         layer_shapes = text_to_layer_shapes(syl)
         if not layer_shapes:
             continue
@@ -1574,6 +1691,7 @@ def melt_line(
                 line_layer_base=line_layer_base,
                 style_name=style_name,
                 config=config,
+                is_last_syl=is_last_syl,
             )
         )
         events.extend(
@@ -1585,6 +1703,7 @@ def melt_line(
                 style_name=style_name,
                 config=config,
                 rng=rng,
+                is_last_syl=is_last_syl,
             )
         )
         spike_points = _collect_shape_points(layer_shapes)
@@ -1597,6 +1716,7 @@ def melt_line(
                 style_name=style_name,
                 config=config,
                 rng=rng,
+                is_last_syl=is_last_syl,
             )
         )
 
@@ -1604,9 +1724,9 @@ def melt_line(
 
 
 # Rendering pipeline
-def _process_line_worker(args: tuple[Line, int, MeltConfig, int, str]) -> list[OutputEvent]:
-    line, line_layer_base, config, seed, style_name = args
-    return melt_line(line, line_layer_base, config, seed, style_name=style_name)
+def _process_line_worker(args: tuple[Line, int, MeltConfig, int, str, float]) -> list[OutputEvent]:
+    line, line_layer_base, config, seed, style_name, y_offset = args
+    return melt_line(line, line_layer_base, config, seed, style_name=style_name, y_offset=y_offset)
 
 
 def _write_output_events(io: Ass, template_line: Line, events: list[OutputEvent]) -> None:
@@ -1644,6 +1764,39 @@ def _write_output_events(io: Ass, template_line: Line, events: list[OutputEvent]
 
     io._output.extend(serialized)
     io._plines += len(serialized)
+
+
+def _compute_collision_offsets(target_lines: list[tuple[int, Line]]) -> dict[int, float]:
+    """Aegisub-style collision avoidance for bottom-aligned lines."""
+    offsets: dict[int, float] = {}
+    # (start_ms, end_ms, occupied_top, occupied_bottom)
+    placed: list[tuple[int, int, float, float]] = []
+
+    for _, line in target_lines:
+        if line.styleref.alignment not in (1, 2, 3):
+            continue
+
+        line_height = getattr(line, 'height', 0) or 0
+        if line_height <= 0:
+            continue
+
+        my_top = line.top
+        my_bottom = my_top + line_height
+
+        shift = 0.0
+        for p_start, p_end, p_top, p_bottom in placed:
+            if line.start_time < p_end and p_start < line.end_time:
+                cur_top = my_top - shift
+                cur_bottom = my_bottom - shift
+                if cur_bottom > p_top and cur_top < p_bottom:
+                    shift += cur_bottom - p_top
+
+        if shift > 0:
+            offsets[line.i] = -shift
+
+        placed.append((line.start_time, line.end_time, my_top - shift, my_bottom - shift))
+
+    return offsets
 
 
 def _iter_target_lines(lines: list[Line]) -> list[tuple[int, Line]]:
@@ -1755,6 +1908,8 @@ def render_spike(
         io.save()
         return io.path_output
 
+    collision_offsets = _compute_collision_offsets(target_lines)
+
     work_items = [
         (
             line.copy(),
@@ -1762,6 +1917,7 @@ def render_spike(
             config,
             config.random_seed + line.i,
             style_name,
+            collision_offsets.get(line.i, 0.0),
         )
         for line_index, line in target_lines
     ]
