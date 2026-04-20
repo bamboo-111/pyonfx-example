@@ -60,7 +60,7 @@ class MeltConfig:
     line_pop_ms: int = 140
     line_pop_scale_percent: int = 120
     line_highlight_strength: float = 0.42
-    syllable_stagger_ms: int = 60
+    syllable_stagger_ms: int = 40
     dissolve_duration: int = 1000
     dissolve_start_frac: float = 0.0
     dissolve_end_frac: float = 1
@@ -725,6 +725,35 @@ def _get_karaoke_syllable_times(line, syl) -> tuple[int, int]:
     return int(line.start_time + syl.start_time), int(line.start_time + syl.end_time)
 
 
+def _resolve_dissolve_window(
+    line,
+    syl,
+    config: MeltConfig,
+    *,
+    is_last_syl: bool,
+) -> tuple[int, int, int]:
+    syl_start, syl_end = _get_karaoke_syllable_times(line, syl)
+    karaoke_dur = max(1, syl_end - syl_start)
+    if is_last_syl:
+        base_start = syl_start
+        adaptive_dissolve = karaoke_dur + max(config.dissolve_duration, int(karaoke_dur * 0.5))
+    else:
+        base_start = syl_end
+        adaptive_dissolve = max(config.dissolve_duration, int(karaoke_dur * 0.5))
+
+    start_frac = max(0.0, min(1.0, float(config.dissolve_start_frac)))
+    end_frac = max(0.0, min(1.0, float(config.dissolve_end_frac)))
+    if end_frac < start_frac:
+        end_frac = start_frac
+
+    dissolve_start = base_start + int(adaptive_dissolve * start_frac)
+    dissolve_end = base_start + int(adaptive_dissolve * end_frac)
+    if dissolve_end <= dissolve_start:
+        dissolve_end = dissolve_start + 1
+
+    return dissolve_start, dissolve_end, adaptive_dissolve
+
+
 def _get_glyph_motion_profile(line, syl, config: MeltConfig) -> tuple[int, int, float, float, float]:
     dissolve_start = int(line.start_time + syl.end_time)
     base_shift = max(0.0, config.glyph_shake_shift_px)
@@ -758,12 +787,17 @@ def _build_full_shape_events(
     pop_ms = max(1, config.line_pop_ms)
     pop_scale = max(100, int(config.line_pop_scale_percent))
     syl_start, _ = _get_adjusted_syllable_times(line, syl, config)
-    syl_k_start, dissolve_anchor = _get_karaoke_syllable_times(line, syl)
+    dissolve_start, _, _ = _resolve_dissolve_window(
+        line=line,
+        syl=syl,
+        config=config,
+        is_last_syl=is_last_syl,
+    )
     motion_start_abs, motion_end_abs, motion_dx, motion_dy, motion_frz = _get_glyph_motion_profile(
         line, syl, config
     )
     full_start = max(0, syl_start - lead_in_ms)
-    full_end = max(full_start + 1, syl_k_start if is_last_syl else dissolve_anchor)
+    full_end = max(full_start + 1, dissolve_start)
     syl_left, syl_top = _syl_origin(syl)
     precision = max(0, int(config.output_coord_precision))
     start_x = _format_ass_number_with_precision(syl_left, precision)
@@ -866,23 +900,18 @@ def _build_vector_mask_events(
 
     bounds = layers[0].multipolygon.bounds
     steps = _resolve_effective_mask_steps(bounds, config)
-    syl_start, dissolve_anchor = _get_karaoke_syllable_times(line, syl)
+    syl_start, _ = _get_karaoke_syllable_times(line, syl)
     motion_start_abs, motion_end_abs, motion_dx, motion_dy, motion_frz = _get_glyph_motion_profile(
         line, syl, config
     )
-    karaoke_dur = max(1, dissolve_anchor - syl_start)
-    if is_last_syl:
-        dissolve_start = syl_start
-        adaptive_dissolve = karaoke_dur + max(config.dissolve_duration, int(karaoke_dur * 0.5))
-    else:
-        adaptive_dissolve = max(config.dissolve_duration, int(karaoke_dur * 0.5))
-        dissolve_start = dissolve_anchor
-    preroll = max(0, config.mask_preroll_ms)
-    if is_last_syl:
-        event_start = dissolve_start - preroll
-    else:
-        event_start = max(syl_start, dissolve_start - preroll)
-    effective_window = max(1, adaptive_dissolve - config.pixel_fade_ms)
+    dissolve_start, dissolve_end, _ = _resolve_dissolve_window(
+        line=line,
+        syl=syl,
+        config=config,
+        is_last_syl=is_last_syl,
+    )
+    event_start = max(syl_start, dissolve_start - max(0, config.mask_preroll_ms))
+    effective_window = max(1, (dissolve_end - dissolve_start) - config.pixel_fade_ms)
     death_quantize_ms = _resolve_death_quantize_ms(config)
     mask_preroll_ms = max(0, config.mask_preroll_ms)
     pattern_idx = rng.randrange(7)
@@ -1408,15 +1437,13 @@ def _build_spike_events(
     rng: random.Random,
     is_last_syl: bool = False,
 ) -> list[OutputEvent]:
-    syl_start, dissolve_start = _get_karaoke_syllable_times(line, syl)
-    syl_karaoke_duration = max(1, dissolve_start - syl_start)
-    if is_last_syl:
-        actual_dissolve_start = syl_start
-        adaptive_dissolve = syl_karaoke_duration + max(config.dissolve_duration, int(syl_karaoke_duration * 0.5))
-    else:
-        actual_dissolve_start = dissolve_start
-        adaptive_dissolve = max(config.dissolve_duration, int(syl_karaoke_duration * 0.5))
-    actual_dissolve_end = actual_dissolve_start + adaptive_dissolve
+    actual_dissolve_start, actual_dissolve_end, _ = _resolve_dissolve_window(
+        line=line,
+        syl=syl,
+        config=config,
+        is_last_syl=is_last_syl,
+    )
+    dissolve_span = max(1, actual_dissolve_end - actual_dissolve_start)
     syl_left = float(syl.left)
     syl_top = float(syl.top)
     syl_width = max(1.0, float(getattr(syl, "width", 0.0) or 0.0))
@@ -1613,7 +1640,7 @@ def _build_spike_events(
             )
 
     regular_emit_start = actual_dissolve_start
-    regular_emit_end = actual_dissolve_start + int(adaptive_dissolve * 0.8)
+    regular_emit_end = min(actual_dissolve_end, actual_dissolve_start + int(dissolve_span * 0.8))
     regular_emit_span = max(1, regular_emit_end - regular_emit_start)
     regular_count = _resolve_count_by_rate(
         regular_emit_span,
@@ -1628,7 +1655,7 @@ def _build_spike_events(
         bound_margin=clamp_margin,
     )
 
-    burst_window = max(20, int(adaptive_dissolve * 0.3))
+    burst_window = max(20, int(dissolve_span * 0.3))
     predissolve_count = _resolve_count_by_rate(
         burst_window,
         config.predissolve_spike_count_per_100ms,
@@ -1638,7 +1665,7 @@ def _build_spike_events(
 
     if predissolve_count > 0:
         burst_start = actual_dissolve_start
-        burst_end = actual_dissolve_start + burst_window
+        burst_end = min(actual_dissolve_end, actual_dissolve_start + burst_window)
         burst_span = max(1, burst_end - burst_start)
         _emit_spike_cluster(
             emit_start=burst_start,
