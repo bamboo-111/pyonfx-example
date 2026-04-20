@@ -7,6 +7,7 @@ import math
 import multiprocessing as mp
 import os
 import random
+import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, fields, replace
@@ -28,6 +29,17 @@ SPIKE_BASE_CENTERED.align(an=5)
 SPIKE_BASE_DRAWING = str(SPIKE_BASE_CENTERED)
 _SPIKE_TAG_CACHE: dict[tuple[float, float, float], str] = {}
 _NOISE_MASK_LIBRARY_CACHE: dict[tuple[int, int, int, int, float, int], list[list[MultiPolygon]]] = {}
+_POS_RE = re.compile(r'\\pos\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)')
+
+
+def _compute_line_pos_offset(line) -> tuple[float, float]:
+    text = getattr(line, 'text', '') or ''
+    match = _POS_RE.search(text)
+    if not match:
+        return 0.0, 0.0
+    pos_x = float(match.group(1))
+    pos_y = float(match.group(2))
+    return pos_x - line.x, pos_y - line.y
 
 
 @dataclass(frozen=True, slots=True)
@@ -656,14 +668,14 @@ def _build_full_shape_events(
     if not layers:
         return []
 
-    lead_in_ms = max(0, config.line_lead_in_ms)
     fade_in_ms = max(1, config.line_fade_in_ms)
     highlight_ms = max(0, config.line_highlight_ms)
     pop_ms = max(1, config.line_pop_ms)
     pop_scale = max(100, int(config.line_pop_scale_percent))
     syl_start, _ = _get_adjusted_syllable_times(line, syl, config)
-    _, dissolve_anchor = _get_karaoke_syllable_times(line, syl)
-    full_start = max(0, syl_start - lead_in_ms)
+    syl_kara_start, dissolve_anchor = _get_karaoke_syllable_times(line, syl)
+    syl_duration = max(1, dissolve_anchor - syl_kara_start)
+    full_start = max(0, syl_start - syl_duration)
     full_end = max(full_start + 1, dissolve_anchor)
     syl_left, syl_top = _syl_origin(syl)
     precision = max(0, int(config.output_coord_precision))
@@ -757,7 +769,9 @@ def _build_vector_mask_events(
     bounds = layers[0].multipolygon.bounds
     steps = _resolve_effective_mask_steps(bounds, config)
     syl_start, _ = _get_adjusted_syllable_times(line, syl, config)
-    event_start = max(0, syl_start - max(0, config.line_lead_in_ms))
+    syl_kara_start, syl_kara_end = _get_karaoke_syllable_times(line, syl)
+    syl_duration = max(1, syl_kara_end - syl_kara_start)
+    event_start = max(0, syl_start - syl_duration)
     event_end = max(event_start + 1, syl_start)
     entry_window = max(1, event_end - event_start)
     reveal_fade_ms = max(40, min(config.pixel_fade_ms, entry_window))
@@ -1244,7 +1258,9 @@ def _build_spike_events(
         return []
 
     syl_start, _ = _get_adjusted_syllable_times(line, syl, config)
-    entry_start = max(0, syl_start - max(0, config.line_lead_in_ms))
+    syl_kara_start, syl_kara_end = _get_karaoke_syllable_times(line, syl)
+    syl_duration = max(1, syl_kara_end - syl_kara_start)
+    entry_start = max(0, syl_start - syl_duration)
     entry_end = max(entry_start + 1, syl_start)
     entry_span = max(1, entry_end - entry_start)
     syl_left = float(syl.left)
@@ -1412,12 +1428,18 @@ def melt_line(
     config: MeltConfig,
     seed: int,
     style_name: str = "p",
+    y_offset: float = 0.0,
 ) -> list[OutputEvent]:
     rng = random.Random(seed)
     events: list[OutputEvent] = []
     syllables = Utils.all_non_empty(line.syls, progress_bar=False)
+    pos_dx, pos_dy = _compute_line_pos_offset(line)
+    pos_dy += y_offset
 
     for syl in syllables:
+        if pos_dx != 0.0 or pos_dy != 0.0:
+            syl.left += pos_dx
+            syl.top += pos_dy
         layer_shapes = text_to_layer_shapes(syl)
         if not layer_shapes:
             continue
@@ -1460,9 +1482,9 @@ def melt_line(
 
 
 # Rendering pipeline
-def _process_line_worker(args: tuple[Line, int, MeltConfig, int, str]) -> list[OutputEvent]:
-    line, line_layer_base, config, seed, style_name = args
-    return melt_line(line, line_layer_base, config, seed, style_name=style_name)
+def _process_line_worker(args: tuple[Line, int, MeltConfig, int, str, float]) -> list[OutputEvent]:
+    line, line_layer_base, config, seed, style_name, y_offset = args
+    return melt_line(line, line_layer_base, config, seed, style_name=style_name, y_offset=y_offset)
 
 
 def _write_output_events(io: Ass, template_line: Line, events: list[OutputEvent]) -> None:
@@ -1500,6 +1522,38 @@ def _write_output_events(io: Ass, template_line: Line, events: list[OutputEvent]
 
     io._output.extend(serialized)
     io._plines += len(serialized)
+
+
+def _compute_collision_offsets(target_lines: list[tuple[int, Line]]) -> dict[int, float]:
+    """Aegisub-style collision avoidance for bottom-aligned lines."""
+    offsets: dict[int, float] = {}
+    placed: list[tuple[int, int, float, float]] = []
+
+    for _, line in target_lines:
+        if line.styleref.alignment not in (1, 2, 3):
+            continue
+
+        line_height = getattr(line, 'height', 0) or 0
+        if line_height <= 0:
+            continue
+
+        my_top = line.top
+        my_bottom = my_top + line_height
+
+        shift = 0.0
+        for p_start, p_end, p_top, p_bottom in placed:
+            if line.start_time < p_end and p_start < line.end_time:
+                cur_top = my_top - shift
+                cur_bottom = my_bottom - shift
+                if cur_bottom > p_top and cur_top < p_bottom:
+                    shift += cur_bottom - p_top
+
+        if shift > 0:
+            offsets[line.i] = -shift
+
+        placed.append((line.start_time, line.end_time, my_top - shift, my_bottom - shift))
+
+    return offsets
 
 
 def _iter_target_lines(lines: list[Line]) -> list[tuple[int, Line]]:
@@ -1598,6 +1652,8 @@ def render_spike(
         io.save()
         return io.path_output
 
+    collision_offsets = _compute_collision_offsets(target_lines)
+
     work_items = [
         (
             line.copy(),
@@ -1605,6 +1661,7 @@ def render_spike(
             config,
             config.random_seed + line.i,
             style_name,
+            collision_offsets.get(line.i, 0.0),
         )
         for line_index, line in target_lines
     ]

@@ -290,7 +290,15 @@ def _syl_origin(syl) -> tuple[int, int]:
 def text_to_layer_shapes(obj) -> list[LayerShape]:
     style = obj.styleref
     shape = Convert.text_to_shape(obj).move(obj.left % 1, obj.top % 1)
-    fill_mp = _repair_geometry(shape.to_multipolygon())
+    raw_mp = shape.to_multipolygon()
+    # Pre-clean with buffer(0) before full repair — fixes glyphs whose
+    # bezier-to-polygon conversion produces self-intersecting rings
+    try:
+        if not raw_mp.is_empty and not raw_mp.is_valid:
+            raw_mp = _ensure_multipolygon(make_valid(raw_mp.buffer(0.01).buffer(-0.01)))
+    except (GEOSException, ShapelyError, ValueError, TypeError):
+        pass
+    fill_mp = _repair_geometry(raw_mp)
     if fill_mp.is_empty:
         return []
 
@@ -1157,6 +1165,8 @@ def _apply_preset_overrides(
 
 
 def _random_spike_color(rng: random.Random) -> str:
+    if rng.random() < 1 / 3:
+        return "&H00000000&"
     red = int(round(rng.uniform(0.0, 229.0)))
     return f"&H0000{red:02X}&"
 
@@ -1516,8 +1526,18 @@ def _build_spike_events(
             travel = lifetime * 0.001 * travel_scale
             x2 = sx + (vel_x * travel)
             y2 = sy + (vel_y * travel)
+
+            # Random lateral drift: perpendicular acceleration
+            lateral_strength = rng.uniform(-0.55, 0.55) * travel
+            perp_x = -vel_y / max(0.0001, math.hypot(vel_x, vel_y))
+            perp_y =  vel_x / max(0.0001, math.hypot(vel_x, vel_y))
+            x2 += perp_x * lateral_strength
+            y2 += perp_y * lateral_strength
+
             x2 = min(bound_max_x, max(bound_min_x, x2))
             y2 = min(bound_max_y, max(bound_min_y, y2))
+            # end_angle follows actual trajectory direction
+            end_angle = math.degrees(math.atan2(y2 - sy, x2 - sx))
 
             target_scale_y = rng.uniform(config.spike_scale_y_min, config.spike_scale_y_max) * scale_y_boost
             target_scale_x = (
@@ -1535,6 +1555,7 @@ def _build_spike_events(
                 f"\\fscy{_format_ass_number(start_scale_y * 100.0)}"
                 f"\\frz{_format_ass_number(-draw_angle)}"
             )
+            end_frz_tag = f"\\frz{_format_ass_number(-end_angle)}"
             target_scale_tags = (
                 f"\\fscx{_format_ass_number(target_scale_x * 100.0)}"
                 f"\\fscy{_format_ass_number(target_scale_y * 100.0)}"
@@ -1560,6 +1581,7 @@ def _build_spike_events(
                     f"{{{move_tag}\\p1\\bord0\\shad0\\blur{_format_ass_number(config.spike_glow_outer_blur)}"
                     f"\\1c{spike_color}\\alpha&HFF&{outer_start_tags}"
                     f"\\t(0,{size_peak_ms},{outer_target_tags})"
+                    f"\\t(0,{lifetime},{end_frz_tag})"
                     f"\\t(0,{alpha_peak_ms},\\alpha{glow_outer_alpha})"
                     f"\\t({alpha_peak_ms},{lifetime},\\alpha&HFF&)}}{SPIKE_BASE_DRAWING}"
                 )
@@ -1586,6 +1608,7 @@ def _build_spike_events(
                     f"{{{move_tag}\\p1\\bord0\\shad0\\blur{_format_ass_number(config.spike_glow_inner_blur)}"
                     f"\\1c{spike_color}\\alpha&HFF&{inner_start_tags}"
                     f"\\t(0,{size_peak_ms},{inner_target_tags})"
+                    f"\\t(0,{lifetime},{end_frz_tag})"
                     f"\\t(0,{alpha_peak_ms},\\alpha{glow_inner_alpha})"
                     f"\\t({alpha_peak_ms},{lifetime},\\alpha&HFF&)}}{SPIKE_BASE_DRAWING}"
                 )
@@ -1602,6 +1625,7 @@ def _build_spike_events(
             text = (
                 f"{{{move_tag}\\p1\\bord0\\shad0\\blur{blur_text}\\1c{spike_color}\\alpha&HFF&{start_tags}"
                 f"\\t(0,{size_peak_ms},{target_scale_tags})"
+                f"\\t(0,{lifetime},{end_frz_tag})"
                 f"\\t(0,{alpha_peak_ms},\\alpha&H00&)"
                 f"\\t({alpha_peak_ms},{lifetime},\\alpha&HFF&)}}{SPIKE_BASE_DRAWING}"
             )
