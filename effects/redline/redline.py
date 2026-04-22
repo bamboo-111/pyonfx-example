@@ -15,6 +15,8 @@ from pyonfx import Ass, Line, Utils
 
 
 LAYERS_PER_LINE = 5
+MAX_RENDER_SLICES = 200
+FLOAT_EPSILON = 1e-6
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +25,8 @@ class MeltConfig:
     line_fade_in_ms: int = 90
     line_highlight_ms: int = 70
     line_pop_ms: int = 140
+    line_long_hold_threshold_ms: int = 240
+    line_long_hold_tail_ms: int = 520
 
     enable_multiprocessing: bool = True
     multiprocessing_min_lines: int = 6
@@ -56,7 +60,7 @@ class MeltConfig:
     boil_cycles: float = 1.6
 
     spark_count_min: int = 3
-    spark_count_max: int = 4
+    spark_count_max: int = 3
     spark_len_min_px: float = 12.0
     spark_len_max_px: float = 28.0
     spark_follow_smooth_x: float = 0.72
@@ -82,6 +86,8 @@ class MeltConfig:
     butterfly_min_syllable_gap: int = 2
     butterfly_max_syllable_gap: int = 5
     butterfly_gap_probability_step: float = 0.3
+    butterfly_long_hold_interval_ms: int = 520
+    butterfly_long_hold_max_extra: int = 6
     butterfly_spawn_jitter_x_px: float = 34.0
     butterfly_spawn_jitter_up_px: float = 40.0
     butterfly_direction_min_deg: float = -170.0
@@ -230,7 +236,7 @@ def lerp(a: float, b: float, t: float) -> float:
 def smoothstep(edge0: float, edge1: float, x: float) -> float:
     """Return a GLSL-like smoothstep with support for reversed edges."""
 
-    if math.isclose(edge0, edge1, abs_tol=1e-6):
+    if math.isclose(edge0, edge1, abs_tol=FLOAT_EPSILON):
         return 0.0 if x < edge0 else 1.0
     t = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
@@ -300,17 +306,87 @@ def hash_noise(s: float, k: int, seed: int) -> float:
     return _noise_seed(seed, bucket + k * 8191).uniform(-1.0, 1.0)
 
 
+def _fract(value: float) -> float:
+    """Return the fractional part of a float."""
+
+    return value - math.floor(value)
+
+
+def _hash_2d(ix: int, iy: int, seed: int = 0) -> float:
+    """Hash integer grid coordinates to [0, 1)."""
+
+    n = ix * 127.1 + iy * 311.7 + seed * 74.7
+    return _fract(math.sin(n) * 43758.5453123)
+
+
+def value_noise_2d(x: float, y: float, seed: int = 0) -> float:
+    """Return smooth value noise in [-1, 1]."""
+
+    x0 = math.floor(x)
+    y0 = math.floor(y)
+    tx = smoothstep(0.0, 1.0, x - x0)
+    ty = smoothstep(0.0, 1.0, y - y0)
+
+    a = _hash_2d(x0, y0, seed)
+    b = _hash_2d(x0 + 1, y0, seed)
+    c = _hash_2d(x0, y0 + 1, seed)
+    d = _hash_2d(x0 + 1, y0 + 1, seed)
+    ab = a + (b - a) * tx
+    cd = c + (d - c) * tx
+    return (ab + (cd - ab) * ty) * 2.0 - 1.0
+
+
+def fbm(x: float, y: float, seed: int = 0, octaves: int = 3) -> float:
+    """Return fractal Brownian motion based on value noise."""
+
+    value = 0.0
+    amp = 0.5
+    freq = 1.0
+    total = 0.0
+    for octave in range(octaves):
+        value += value_noise_2d(x * freq, y * freq, seed + octave * 17) * amp
+        total += amp
+        amp *= 0.5
+        freq *= 2.03
+    return value / total if total else 0.0
+
+
 def _phase_from_seed(seed: int, channel: int) -> float:
     """Return a deterministic phase offset."""
 
     return _noise_seed(seed, channel).uniform(0.0, math.tau)
 
 
+def _syl_time_to_absolute(line: Line, syl_time_ms: float) -> float:
+    """Convert syllable time to absolute timeline time when needed."""
+
+    line_start = float(getattr(line, "start_time", 0.0))
+    line_end = float(getattr(line, "end_time", line_start))
+    line_duration = max(0.0, line_end - line_start)
+    if line_start > 1.0 and syl_time_ms <= line_duration + 1.0:
+        return line_start + syl_time_ms
+    return syl_time_ms
+
+
+def _effective_stroke_end_time(line: Line, syllables: Sequence[object], config: MeltConfig) -> float:
+    """End main stroke near karaoke timing, while allowing a short long-note tail."""
+
+    line_end = float(getattr(line, "end_time", 0.0))
+    if not syllables:
+        return line_end
+
+    last_kf_end = max(_syl_time_to_absolute(line, syl.end_time) for syl in syllables)
+    trailing_hold = line_end - last_kf_end
+    if trailing_hold <= config.line_long_hold_threshold_ms:
+        return line_end
+    return min(line_end, last_kf_end + config.line_long_hold_tail_ms)
+
+
 def _normalize(dx: float, dy: float) -> tuple[float, float]:
     """Normalize a vector with a safe fallback."""
 
     length = math.hypot(dx, dy)
-    if length <= 1e-6:
+    if length <= FLOAT_EPSILON:
         return (1.0, 0.0)
     return (dx / length, dy / length)
 
@@ -387,45 +463,82 @@ def _apply_curve_profile(base_points: list[CenterPoint], ctx: SylContext, time_m
 
     config = ctx.config
     t_sec = time_ms / 1000.0
-    layered_count = 6
     phase_main = _phase_from_seed(ctx.seed, 31)
     phase_detail = _phase_from_seed(ctx.seed, 32)
     phase_endpoint = _phase_from_seed(ctx.seed, 33)
     curved: list[CenterPoint] = []
+
+    # Tuned from the current validator panel values.
+    ui_amplitude = 80.0
+    ui_speed = 1.0
+    ui_spatial_frequency = 3.0
+    ui_detail_strength = 0.35
+    ui_inertia = 0.18
+    ui_active_region_strength = 1.0
+    ui_frame_skip = 4
+
+    # Slightly smooth only the second subtitle line.
+    if int(getattr(ctx.line, "i", -1)) == 1:
+        ui_spatial_frequency *= 0.92
+        ui_detail_strength *= 0.82
+        ui_amplitude *= 0.95
+
+    hold_step_sec = max(1.0 / max(1.0, config.anim_fps), 1e-3) * ui_frame_skip
+    detail_time_sec = math.floor(t_sec / hold_step_sec) * hold_step_sec
+    wind_time = t_sec * ui_speed * (0.34 + 0.22 * ui_inertia)
+    phase = wind_time * math.tau + phase_main * 0.12
+    phase_jitter = fbm(wind_time * 0.11 + 5.0 + phase_detail, 0.0, 141 + ctx.seed % 17, 3)
+    shape_mix = 0.5 + 0.5 * fbm(wind_time * 0.09 + 2.0 + phase_main, 1.0, 142 + ctx.seed % 19, 3)
+    global_push = value_noise_2d(wind_time * 0.18 + 17.0 + phase_main * 0.3, 0.0, 121)
+    gust_center = 0.5 + 0.28 * math.sin(wind_time * 0.43 + 1.8 + phase_main)
+    gust_center += 0.12 * value_noise_2d(wind_time * 0.16 + 4.0 + phase_detail * 0.2, 2.0, 122)
+    gust_center = clamp(gust_center, 0.08, 0.92)
+    gust_width = 0.30 + 0.07 * math.sin(wind_time * 0.31 + 0.4 + phase_detail * 0.1)
+    arc_bias = config.curve_arc_px * 0.42
+    wave_px_scale = config.curve_arc_px / 18.0
+
     for point in base_points:
         x_norm = lerp(-1.0, 1.0, point.s)
-        envelope = 1.0
-        arc_bias = config.curve_arc_px * 0.42
+        distance = abs(point.s - gust_center)
+        gust = math.exp(-((distance / max(0.12, gust_width)) ** 2)) * ui_active_region_strength
+        edge_fade = math.sin(math.pi * point.s)
 
-        # Keep one dominant travelling wave so the line body visibly moves over time.
-        skew = clamp(config.curve_peak_skew, -0.75, 0.75)
-        skewed_s = clamp(point.s + skew * point.s * (1.0 - point.s), 0.0, 1.0)
-        primary_phase = math.tau * (config.curve_wave_cycles * skewed_s - config.curve_wave_speed_hz * t_sec) + phase_main
-        skew_side = 1.0 if skew >= 0.0 else -1.0
-        skew_amount = abs(skew)
-        primary_wave = (
-            math.sin(primary_phase)
-            + skew_amount * 0.22 * math.sin(primary_phase * 2.0 + skew_side * math.pi * 0.46)
-            + skew_amount * 0.10 * math.sin(primary_phase * 3.0 - skew_side * math.pi * 0.18)
+        local_warp = fbm(
+            point.s * (ui_spatial_frequency * 1.6) + phase_jitter * 1.9,
+            wind_time * 0.24 + 3.0,
+            143 + ctx.seed % 13,
+            2,
         )
-        primary_wave = clamp(primary_wave / (1.0 + skew_amount * 0.16), -1.0, 1.0)
-        detail_wave = math.sin(t_sec * 1.8 + x_norm * 4.8 + phase_detail)
-        wave_sum = 0.0
-        for band_index in range(layered_count):
-            band_t = band_index / (layered_count - 1)
-            speed = 1.0 + band_t
-            height = 4.0 + band_t
-            wave_sum += math.sin(t_sec * speed + x_norm * height)
+        advected_u = point.s * ui_spatial_frequency - wind_time
+        advected_u += local_warp * 0.18 + phase_jitter * 0.09
 
-        shimmer_wave = wave_sum / layered_count
-        wave_shape = clamp(primary_wave + detail_wave * 0.25 + shimmer_wave * 0.15, -1.0, 1.0)
-        wave_span = config.curve_arc_px * 1.00
-        wave = wave_span * wave_shape
-        harmonic_offset = _harmonic_offset(point.s, x_norm, t_sec, ctx)
+        carrier = math.sin(advected_u * math.tau * 0.62 + phase * (0.14 + 0.08 * shape_mix))
+        shoulder = math.sin(
+            advected_u * math.tau * 1.08 - phase * (0.08 + 0.06 * (1.0 - shape_mix)) + 1.9
+        )
+        bow = math.sin(math.pi * point.s + global_push * 0.55)
+        broad_noise = fbm(advected_u * 0.72 + 8.0, wind_time * (0.28 + 0.11 * shape_mix), 132, 2)
+        smooth_detail = fbm(advected_u * 1.95 + 13.0, detail_time_sec * 0.52 + 4.1, 144, 2)
+
+        body = carrier * (0.34 + 0.16 * shape_mix)
+        body += shoulder * (0.11 + 0.13 * (1.0 - shape_mix))
+        body += broad_noise * 0.24
+        body += bow * global_push * 0.30
+        detail = smooth_detail * ui_detail_strength * (0.05 + 0.04 * gust)
+        amp = ui_amplitude * edge_fade * (0.54 + 0.34 * gust)
+        wave = (global_push * 0.22 + body + detail) * amp * wave_px_scale
+
+        harmonic_offset = _harmonic_offset(point.s, x_norm, t_sec, ctx) * 0.55
         right_endpoint_weight = smoothstep(0.86, 1.0, point.s)
-        endpoint_wave = math.sin(math.tau * (config.curve_wave_speed_hz * 1.15 * t_sec) + phase_endpoint)
-        endpoint_offset = config.curve_arc_px * 0.16 * right_endpoint_weight * endpoint_wave
-        curved.append(CenterPoint(x=point.x, y=point.y - arc_bias - wave - harmonic_offset - endpoint_offset, s=point.s))
+        endpoint_wave = math.sin(math.tau * (ui_speed * 0.95 * t_sec) + phase_endpoint)
+        endpoint_offset = config.curve_arc_px * 0.12 * right_endpoint_weight * endpoint_wave
+        curved.append(
+            CenterPoint(
+                x=point.x,
+                y=point.y - arc_bias - wave - harmonic_offset - endpoint_offset,
+                s=point.s,
+            )
+        )
     return curved
 
 
@@ -477,7 +590,7 @@ def _clip_centerline(points: list[CenterPoint], x_cut: float) -> list[CenterPoin
                 continue
 
             dx = nxt.x - current.x
-            if abs(dx) <= 1e-6:
+            if abs(dx) <= FLOAT_EPSILON:
                 break
             ratio = clamp((x_cut - current.x) / dx, 0.0, 1.0)
             y = lerp(current.y, nxt.y, ratio)
@@ -487,7 +600,7 @@ def _clip_centerline(points: list[CenterPoint], x_cut: float) -> list[CenterPoin
 
         if next_in:
             dx = nxt.x - current.x
-            if abs(dx) <= 1e-6:
+            if abs(dx) <= FLOAT_EPSILON:
                 continue
             ratio = clamp((x_cut - current.x) / dx, 0.0, 1.0)
             y = lerp(current.y, nxt.y, ratio)
@@ -513,7 +626,7 @@ def _clip_polyline_prefix(points: list[tuple[float, float]], consume_px: float) 
     clipped: list[tuple[float, float]] = []
     for current, nxt in zip(points, points[1:]):
         seg_len = math.hypot(nxt[0] - current[0], nxt[1] - current[1])
-        if seg_len <= 1e-6:
+        if seg_len <= FLOAT_EPSILON:
             continue
         if remaining >= seg_len:
             remaining -= seg_len
@@ -601,7 +714,7 @@ def _build_right_knot_drawings(points: list[CenterPoint], ctx: SylContext, consu
             numerator += local_y * x2
             denominator += x2 * x2
 
-        curvature = numerator / denominator if denominator > 1e-6 else 0.0
+        curvature = numerator / denominator if denominator > FLOAT_EPSILON else 0.0
         max_wave_px = max(1.0, ctx.config.curve_wave_amp_px * 0.45)
         knot_exit_x, knot_exit_y = local_to_world(50.0, 0.0)
         return [
@@ -646,7 +759,7 @@ def _build_right_knot_drawings(points: list[CenterPoint], ctx: SylContext, consu
         slope1: float,
     ) -> tuple[float, float, float, float]:
         dx = x1 - x0
-        if abs(dx) <= 1e-6:
+        if abs(dx) <= FLOAT_EPSILON:
             return (0.0, 0.0, slope0, y0)
         dy = y1 - y0
         a_local = ((slope1 + slope0) * dx - 2.0 * dy) / (dx**3)
@@ -668,7 +781,7 @@ def _build_right_knot_drawings(points: list[CenterPoint], ctx: SylContext, consu
 
     def cubic_y(x: float) -> float:
         base_y = cubic_a * x**3 + cubic_b * x**2 + cubic_c * x + cubic_d
-        u = clamp(x / max(1e-6, right_x), 0.0, 1.0)
+        u = clamp(x / max(FLOAT_EPSILON, right_x), 0.0, 1.0)
         mid_lift = math.sin(math.pi * u) ** 2
         return base_y + circle_r * 0.13 * mid_lift
 
@@ -748,7 +861,7 @@ def _endpoint_cap_arc(path: RibbonPath, *, at_start: bool) -> list[tuple[float, 
         angle_step = math.pi / 5
 
     radius = math.hypot(edge_point[0] - center[0], edge_point[1] - center[1])
-    if radius <= 1e-6:
+    if radius <= FLOAT_EPSILON:
         return []
 
     theta = math.atan2(tangent[1], tangent[0])
@@ -832,6 +945,39 @@ def _ass_timestamp_from_ms(value_ms: float) -> str:
     seconds = (total_centiseconds // 100) % 60
     centiseconds = total_centiseconds % 100
     return f"{hours:d}:{minutes:02d}:{seconds:02d}.{centiseconds:02d}"
+
+
+def _cached_ass_timestamp(time_cache: dict[float, str], value_ms: float) -> str:
+    """Return a cached ASS timestamp for a rounded millisecond value."""
+
+    rounded_ms = max(0.0, _round_ms(value_ms))
+    timestamp = time_cache.get(rounded_ms)
+    if timestamp is None:
+        timestamp = _ass_timestamp_from_ms(rounded_ms)
+        time_cache[rounded_ms] = timestamp
+    return timestamp
+
+
+def _format_ass_event(
+    *,
+    event_kind: str,
+    layer: int,
+    start_text: str,
+    end_text: str,
+    style: str,
+    actor: str,
+    margin_l: str,
+    margin_r: str,
+    margin_v: str,
+    effect: str,
+    text: str,
+) -> str:
+    """Serialize one ASS event line."""
+
+    return (
+        f"{event_kind}: {layer},{start_text},{end_text},{style},{actor},"
+        f"{margin_l},{margin_r},{margin_v},{effect},{text}\n"
+    )
 
 
 def _slice_step_ms(config: MeltConfig) -> float:
@@ -1201,8 +1347,10 @@ def _build_full_shape_events(
     """Build a short establishing stroke event before mask slicing takes over."""
 
     ctx = _build_syl_context(line, syl, config)
-    start_time = _round_ms(syl.start_time)
-    end_time = _round_ms(min(syl.end_time, start_time + max(config.min_slice_ms, config.line_fade_in_ms)))
+    syl_start_abs = _syl_time_to_absolute(line, syl.start_time)
+    syl_end_abs = _syl_time_to_absolute(line, syl.end_time)
+    start_time = _round_ms(syl_start_abs)
+    end_time = _round_ms(min(syl_end_abs, start_time + max(config.min_slice_ms, config.line_fade_in_ms)))
     if end_time <= start_time:
         return []
 
@@ -1235,6 +1383,8 @@ def _build_vector_mask_events(
     if len(base_points) < 2:
         return []
 
+    syl_start_abs = _syl_time_to_absolute(line, syl.start_time)
+    syl_end_abs = _syl_time_to_absolute(line, syl.end_time)
     dt = max(1.0, _round_ms(syl.end_time - syl.start_time))
     if dt < config.min_slice_ms:
         return _build_static_stroke_events(
@@ -1242,12 +1392,12 @@ def _build_vector_mask_events(
             layers=layers,
             line_layer_base=line_layer_base,
             style_name=style_name,
-            start_time=_round_ms(syl.start_time),
-            end_time=_round_ms(syl.end_time),
+            start_time=_round_ms(syl_start_abs),
+            end_time=_round_ms(syl_end_abs),
         )
 
     step_ms = _slice_step_ms(config)
-    slice_count = min(200, max(1, math.ceil(dt / step_ms)))
+    slice_count = min(MAX_RENDER_SLICES, max(1, math.ceil(dt / step_ms)))
     main_left = base_points[0].x
     main_right = base_points[-1].x
     main_span = max(1.0, main_right - main_left)
@@ -1260,16 +1410,16 @@ def _build_vector_mask_events(
     follow_y = base_points[0].y
     events: list[OutputEvent] = []
     main_seam_trim_px = max(0.75, config.line_width_px * 0.35)
-    spark_prefade_start = syl.end_time - config.spark_prefade_lead_ms
+    spark_prefade_start = syl_end_abs - config.spark_prefade_lead_ms
     spark_prefade_ms = max(1.0, config.spark_prefade_lead_ms)
     spark_tail_fade_ms = max(1.0, config.spark_tail_fade_ms)
 
     for frame_index in range(slice_count):
-        start_time = _round_ms(syl.start_time + frame_index * step_ms)
+        start_time = _round_ms(syl_start_abs + frame_index * step_ms)
         end_time = (
-            _round_ms(syl.end_time)
+            _round_ms(syl_end_abs)
             if frame_index == slice_count - 1
-            else _round_ms(min(syl.end_time, start_time + step_ms))
+            else _round_ms(min(syl_end_abs, start_time + step_ms))
         )
         if end_time <= start_time:
             continue
@@ -1290,7 +1440,7 @@ def _build_vector_mask_events(
             left_tip_x = (ribbon.left[0][0] + ribbon.right[0][0]) * 0.5
             left_tip_y = (ribbon.left[0][1] + ribbon.right[0][1]) * 0.5
             follow_x, follow_y = _smooth_follow_anchor(follow_x, follow_y, left_tip_x, left_tip_y, step_ms, config)
-        u = clamp((time_ms - syl.start_time) / dt, 0.0, 1.0)
+        u = clamp((time_ms - syl_start_abs) / dt, 0.0, 1.0)
 
         if not drawing and not knot_drawings:
             continue
@@ -1347,7 +1497,7 @@ def _build_spike_events(
     tb = max(1, config.butterfly_duration_ms)
     tf = min(config.butterfly_fade_ms, tb)
     step_ms = _slice_step_ms(config)
-    slice_count = min(200, max(1, math.ceil(tb / step_ms)))
+    slice_count = min(MAX_RENDER_SLICES, max(1, math.ceil(tb / step_ms)))
     frames = _butterfly_frames(config.butterfly_scale)
     seed = _syl_seed(config, line, syl)
     frame_rng = _noise_seed(seed, 503)
@@ -1356,10 +1506,11 @@ def _build_spike_events(
     drawing_scale = max(0.01, config.butterfly_scale)
     fsc = (
         ""
-        if math.isclose(drawing_scale, 1.0, abs_tol=1e-6)
+        if math.isclose(drawing_scale, 1.0, abs_tol=FLOAT_EPSILON)
         else f"\\fscx{drawing_scale * 100:g}\\fscy{drawing_scale * 100:g}"
     )
-    fade_start = syl.end_time + tb - tf
+    syl_end_abs = _syl_time_to_absolute(line, syl.end_time)
+    fade_start = syl_end_abs + tb - tf
     x0 = (syl.left + syl.right) * 0.5 + motion_rng.uniform(
         -config.butterfly_spawn_jitter_x_px, config.butterfly_spawn_jitter_x_px
     )
@@ -1395,16 +1546,16 @@ def _build_spike_events(
 
     events: list[OutputEvent] = []
     for frame_index in range(slice_count):
-        start_time = _round_ms(syl.end_time + frame_index * step_ms)
+        start_time = _round_ms(syl_end_abs + frame_index * step_ms)
         end_time = (
-            _round_ms(syl.end_time + tb)
+            _round_ms(syl_end_abs + tb)
             if frame_index == slice_count - 1
-            else _round_ms(min(syl.end_time + tb, start_time + step_ms))
+            else _round_ms(min(syl_end_abs + tb, start_time + step_ms))
         )
         if end_time <= start_time:
             continue
 
-        u = clamp((start_time - syl.end_time) / tb, 0.0, 1.0)
+        u = clamp((start_time - syl_end_abs) / tb, 0.0, 1.0)
         arc_u = 4.0 * u * (1.0 - u)
         x = x0 + move_dx * u + arc_x * arc_u
         y = y0 + move_dy * u + arc_y * arc_u
@@ -1460,6 +1611,109 @@ def _build_spike_events(
     return events
 
 
+def _tail_release_time(stroke_proxy: object, tail_points: list[CenterPoint], tail_ctx: SylContext) -> float:
+    """Return the time when the tail wipe first enters the right-side knot."""
+
+    release_time = float(stroke_proxy.end_time)
+    if len(tail_points) < 2:
+        return release_time
+
+    config = tail_ctx.config
+    main_span = max(1.0, tail_points[-1].x - tail_points[0].x)
+    knot_span = _estimate_right_knot_length_px(tail_ctx)
+    wipe_speed = max(0.1, config.tail_knot_wipe_speed)
+    wipe_span = main_span + knot_span / wipe_speed
+    stroke_dt = max(1.0, stroke_proxy.end_time - stroke_proxy.start_time)
+    knot_entry_ratio = clamp(main_span / max(FLOAT_EPSILON, wipe_span), 0.0, 1.0)
+    release_time = _round_ms(stroke_proxy.start_time + stroke_dt * knot_entry_ratio)
+    return min(stroke_proxy.end_time, max(stroke_proxy.start_time, release_time))
+
+
+def _tail_anchor(
+    stroke_proxy: object,
+    tail_points: list[CenterPoint],
+    tail_ctx: SylContext,
+    release_time: float,
+) -> tuple[float, float]:
+    """Return the right-side tail anchor for butterfly release."""
+
+    if len(tail_points) < 2:
+        return float(stroke_proxy.right), float(stroke_proxy.middle)
+
+    frame_index = int(
+        max(
+            0.0,
+            (release_time - stroke_proxy.start_time) / max(1.0, _slice_step_ms(tail_ctx.config)),
+        )
+    )
+    tail_perturbed = _perturb_centerline(tail_points, tail_ctx, release_time, frame_index)
+    if not tail_perturbed:
+        return float(stroke_proxy.right), float(stroke_proxy.middle)
+    return tail_perturbed[-1].x, tail_perturbed[-1].y
+
+
+def _tail_release_times(release_time: float, line_end_time: float, config: MeltConfig) -> list[float]:
+    """Return initial and long-hold tail butterfly release times."""
+
+    release_times = [release_time]
+    long_hold_span = max(0.0, line_end_time - release_time)
+    if long_hold_span <= config.line_long_hold_threshold_ms:
+        return release_times
+
+    interval = max(120, config.butterfly_long_hold_interval_ms)
+    extra_count = min(
+        max(0, config.butterfly_long_hold_max_extra),
+        max(0, int(math.floor(long_hold_span / interval))),
+    )
+    release_times.extend(release_time + interval * index for index in range(1, extra_count + 1))
+    return release_times
+
+
+def _build_tail_butterfly_events(
+    *,
+    line: Line,
+    stroke_proxy: object,
+    syllable_id_base: int,
+    tail_anchor_x: float,
+    tail_anchor_y: float,
+    release_times: Sequence[float],
+    line_layer_base: int,
+    style_name: str,
+    config: MeltConfig,
+) -> list[OutputEvent]:
+    """Build butterfly releases attached to the stroke tail."""
+
+    anchor_half_width = max(4.0, config.line_width_px * 1.8)
+    anchor_half_height = max(4.0, config.line_width_px * 1.4)
+    line_end_time = float(getattr(line, "end_time", release_times[0]))
+    events: list[OutputEvent] = []
+
+    for release_index, release_time in enumerate(release_times):
+        if release_time >= line_end_time:
+            continue
+        release_proxy = SimpleNamespace(
+            # Vary the pseudo syllable id so each long-hold butterfly keeps normal randomness.
+            i=syllable_id_base + 100 + release_index,
+            left=tail_anchor_x - anchor_half_width,
+            right=tail_anchor_x + anchor_half_width,
+            top=tail_anchor_y - anchor_half_height,
+            middle=tail_anchor_y,
+            bottom=tail_anchor_y + anchor_half_height,
+            start_time=stroke_proxy.start_time,
+            end_time=_round_ms(release_time),
+        )
+        events.extend(
+            _build_spike_events(
+                line=line,
+                syl=release_proxy,
+                line_layer_base=line_layer_base,
+                style_name=style_name,
+                config=config,
+            )
+        )
+    return events
+
+
 def melt_line(
     line,
     line_layer_base: int,
@@ -1478,14 +1732,16 @@ def melt_line(
         for syl in syllables:
             _shift_syl_geometry(syl, y_offset)
 
+    stroke_end_time = _effective_stroke_end_time(line, syllables, config)
     stroke_proxy = SimpleNamespace(
         i=syllables[0].i,
         left=getattr(line, "left", min(syl.left for syl in syllables)),
         right=getattr(line, "right", max(syl.right for syl in syllables)),
+        top=min(syl.top for syl in syllables),
         middle=getattr(line, "middle", max(syl.middle for syl in syllables)),
         bottom=max(syl.bottom for syl in syllables),
         start_time=line.start_time,
-        end_time=line.end_time,
+        end_time=stroke_end_time,
     )
     layer_shapes = text_to_layer_shapes(stroke_proxy, config)
     if layer_shapes:
@@ -1494,6 +1750,26 @@ def melt_line(
                 line=line,
                 syl=stroke_proxy,
                 layers=layer_shapes,
+                line_layer_base=line_layer_base,
+                style_name=style_name,
+                config=config,
+            )
+        )
+        # Release one extra butterfly when wipe enters the right-side knot
+        # (slightly earlier than full disappearance).
+        tail_ctx = _build_syl_context(line, stroke_proxy, config)
+        tail_points = _sample_centerline(tail_ctx)
+        tail_release_end_time = _tail_release_time(stroke_proxy, tail_points, tail_ctx)
+        tail_anchor_x, tail_anchor_y = _tail_anchor(stroke_proxy, tail_points, tail_ctx, tail_release_end_time)
+        long_hold_end = float(getattr(line, "end_time", tail_release_end_time))
+        events.extend(
+            _build_tail_butterfly_events(
+                line=line,
+                stroke_proxy=stroke_proxy,
+                syllable_id_base=syllables[-1].i,
+                tail_anchor_x=tail_anchor_x,
+                tail_anchor_y=tail_anchor_y,
+                release_times=_tail_release_times(tail_release_end_time, long_hold_end, config),
                 line_layer_base=line_layer_base,
                 style_name=style_name,
                 config=config,
@@ -1538,20 +1814,20 @@ def _write_original_lines(io: Ass, lines: list[Line]) -> None:
     time_cache: dict[float, str] = {}
     serialized: list[str] = []
     for line in lines:
-        start_ms = max(0.0, _round_ms(line.start_time))
-        end_ms = max(0.0, _round_ms(line.end_time))
-        start_text = time_cache.get(start_ms)
-        if start_text is None:
-            start_text = _ass_timestamp_from_ms(start_ms)
-            time_cache[start_ms] = start_text
-        end_text = time_cache.get(end_ms)
-        if end_text is None:
-            end_text = _ass_timestamp_from_ms(end_ms)
-            time_cache[end_ms] = end_text
-        event_kind = "Comment"
         serialized.append(
-            f"{event_kind}: {int(getattr(line, 'layer', 0))},{start_text},{end_text},{line.style},{line.actor},"
-            f"{line.margin_l:04d},{line.margin_r:04d},{line.margin_v:04d},{line.effect},{line.raw_text}\n"
+            _format_ass_event(
+                event_kind="Comment",
+                layer=int(getattr(line, "layer", 0)),
+                start_text=_cached_ass_timestamp(time_cache, line.start_time),
+                end_text=_cached_ass_timestamp(time_cache, line.end_time),
+                style=line.style,
+                actor=line.actor,
+                margin_l=f"{line.margin_l:04d}",
+                margin_r=f"{line.margin_r:04d}",
+                margin_v=f"{line.margin_v:04d}",
+                effect=line.effect,
+                text=line.raw_text,
+            )
         )
 
     io._output.extend(serialized)
@@ -1582,22 +1858,20 @@ def _write_output_events(io: Ass, template_line: Line, events: list[OutputEvent]
     serialized: list[str] = []
     append_serialized = serialized.append
     for event in events:
-        start_ms = max(0.0, _round_ms(event.start_time))
-        end_ms = max(0.0, _round_ms(event.end_time))
-
-        start_text = time_cache.get(start_ms)
-        if start_text is None:
-            start_text = _ass_timestamp_from_ms(start_ms)
-            time_cache[start_ms] = start_text
-
-        end_text = time_cache.get(end_ms)
-        if end_text is None:
-            end_text = _ass_timestamp_from_ms(end_ms)
-            time_cache[end_ms] = end_text
-
         append_serialized(
-            f"{event_kind}: {event.layer},{start_text},{end_text},{event.style},{actor},"
-            f"{margin_l},{margin_r},{margin_v},{effect},{event.text}\n"
+            _format_ass_event(
+                event_kind=event_kind,
+                layer=event.layer,
+                start_text=_cached_ass_timestamp(time_cache, event.start_time),
+                end_text=_cached_ass_timestamp(time_cache, event.end_time),
+                style=event.style,
+                actor=actor,
+                margin_l=margin_l,
+                margin_r=margin_r,
+                margin_v=margin_v,
+                effect=effect,
+                text=event.text,
+            )
         )
 
     io._output.extend(serialized)
