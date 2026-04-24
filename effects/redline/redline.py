@@ -364,7 +364,10 @@ def _syl_time_to_absolute(line: Line, syl_time_ms: float) -> float:
     line_start = float(getattr(line, "start_time", 0.0))
     line_end = float(getattr(line, "end_time", line_start))
     line_duration = max(0.0, line_end - line_start)
-    if line_start > 1.0 and syl_time_ms <= line_duration + 1.0:
+    # PyonFX syllables are usually line-relative, but some internal proxies in this
+    # script already use absolute times. Treat values as relative only when they are
+    # clearly inside the line-local 0..duration range and still before line_start.
+    if line_start > 1.0 and 0.0 <= syl_time_ms <= line_duration + 1.0 and syl_time_ms < line_start - 1.0:
         return line_start + syl_time_ms
     return syl_time_ms
 
