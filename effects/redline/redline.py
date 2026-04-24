@@ -8,10 +8,11 @@ import random
 import re
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from types import SimpleNamespace
 
 from pyonfx import Ass, Line, Utils
+from word.word_fx_adapter import create_word_fx_bridge, shift_word_fx_line
 
 
 LAYERS_PER_LINE = 5
@@ -21,7 +22,7 @@ FLOAT_EPSILON = 1e-6
 
 @dataclass(frozen=True, slots=True)
 class MeltConfig:
-    line_lead_in_ms: int = 320
+    line_lead_in_ms: int = 640
     line_fade_in_ms: int = 90
     line_highlight_ms: int = 70
     line_pop_ms: int = 140
@@ -611,6 +612,45 @@ def _clip_centerline(points: list[CenterPoint], x_cut: float) -> list[CenterPoin
     return visible if len(visible) >= 2 else []
 
 
+def _clip_centerline_left(points: list[CenterPoint], x_cut: float) -> list[CenterPoint]:
+    """Clip the centerline to keep only the visible left segment."""
+
+    if len(points) < 2:
+        return []
+
+    visible: list[CenterPoint] = []
+    for current, nxt in zip(points, points[1:]):
+        current_in = current.x <= x_cut
+        next_in = nxt.x <= x_cut
+        if current_in:
+            if not visible:
+                visible.append(current)
+            if next_in:
+                visible.append(nxt)
+                continue
+
+            dx = nxt.x - current.x
+            if abs(dx) <= FLOAT_EPSILON:
+                break
+            ratio = clamp((x_cut - current.x) / dx, 0.0, 1.0)
+            y = lerp(current.y, nxt.y, ratio)
+            s = lerp(current.s, nxt.s, ratio)
+            visible.append(CenterPoint(x=x_cut, y=y, s=s))
+            break
+
+        if next_in:
+            dx = nxt.x - current.x
+            if abs(dx) <= FLOAT_EPSILON:
+                continue
+            ratio = clamp((x_cut - current.x) / dx, 0.0, 1.0)
+            y = lerp(current.y, nxt.y, ratio)
+            s = lerp(current.s, nxt.s, ratio)
+            visible.append(CenterPoint(x=x_cut, y=y, s=s))
+            visible.append(nxt)
+
+    return visible if len(visible) >= 2 else []
+
+
 def _polyline_length(points: Sequence[tuple[float, float]]) -> float:
     """Return the length of a polyline."""
 
@@ -645,7 +685,36 @@ def _clip_polyline_prefix(points: list[tuple[float, float]], consume_px: float) 
     return clipped if len(clipped) >= 2 else []
 
 
-def _build_right_knot_drawings(points: list[CenterPoint], ctx: SylContext, consume_px: float = 0.0) -> list[str]:
+def _clip_polyline_to_length(points: list[tuple[float, float]], visible_px: float) -> list[tuple[float, float]]:
+    """Keep only the first visible_px of a polyline."""
+
+    if len(points) < 2 or visible_px <= 0.0:
+        return []
+
+    remaining = visible_px
+    visible: list[tuple[float, float]] = [points[0]]
+    for current, nxt in zip(points, points[1:]):
+        seg_len = math.hypot(nxt[0] - current[0], nxt[1] - current[1])
+        if seg_len <= FLOAT_EPSILON:
+            continue
+        if remaining >= seg_len:
+            visible.append(nxt)
+            remaining -= seg_len
+            continue
+
+        t = clamp(remaining / seg_len, 0.0, 1.0)
+        visible.append((lerp(current[0], nxt[0], t), lerp(current[1], nxt[1], t)))
+        break
+
+    return visible if len(visible) >= 2 else []
+
+
+def _build_right_knot_drawings(
+    points: list[CenterPoint],
+    ctx: SylContext,
+    consume_px: float = 0.0,
+    visible_px: float | None = None,
+) -> list[str]:
     """Build a natural loop knot from separately layered stroke pieces."""
 
     if not ctx.config.tail_knot_enabled or len(points) < 2:
@@ -725,10 +794,25 @@ def _build_right_knot_drawings(points: list[CenterPoint], ctx: SylContext, consu
             for distance in (extend_px * i / 24 for i in range(25))
         ]
 
-    def consume_ordered_paths(paths: list[list[tuple[float, float]]]) -> list[str]:
+    def take_ordered_paths(paths: list[list[tuple[float, float]]]) -> list[str]:
+        drawings: list[str] = []
+        if visible_px is not None:
+            remaining_visible = max(0.0, visible_px)
+            for path in paths:
+                if remaining_visible <= 0.0:
+                    break
+                path_len = _polyline_length(path)
+                if path_len <= FLOAT_EPSILON:
+                    continue
+                visible = _clip_polyline_to_length(path, remaining_visible)
+                remaining_visible -= path_len
+                drawing = polyline_world_drawing(visible)
+                if drawing:
+                    drawings.append(drawing)
+            return drawings
+
         seam_trim_px = max(0.75, ctx.config.line_width_px * 0.35) if consume_px > 0.0 else 0.0
         remaining = max(0.0, consume_px + seam_trim_px)
-        drawings: list[str] = []
         for path in paths:
             path_len = _polyline_length(path)
             if remaining >= path_len:
@@ -814,7 +898,25 @@ def _build_right_knot_drawings(points: list[CenterPoint], ctx: SylContext, consu
         local_polyline_to_world(lower_right_points),
         continuation_world_points(),
     ]
-    return consume_ordered_paths(ordered_paths)
+    return take_ordered_paths(ordered_paths)
+
+
+def _scaled_syl_context(ctx: SylContext, *, growth: float) -> SylContext:
+    """Scale early lead-in geometry while preserving the main waveform family."""
+
+    config = ctx.config
+    scaled_config = replace(
+        config,
+        line_width_px=max(0.8, config.line_width_px * lerp(0.38, 1.0, growth)),
+        curve_arc_px=max(2.0, config.curve_arc_px * lerp(0.22, 1.0, growth)),
+        curve_wave_amp_px=max(1.0, config.curve_wave_amp_px * lerp(0.24, 1.0, growth)),
+        static_amp_px=config.static_amp_px * lerp(0.15, 1.0, growth),
+        flow_amp_px=config.flow_amp_px * lerp(0.2, 1.0, growth),
+        boil_amp_px=config.boil_amp_px * lerp(0.12, 1.0, growth),
+        tail_knot_radius_px=max(3.0, config.tail_knot_radius_px * lerp(0.35, 1.0, growth)),
+        tail_knot_extend_px=config.tail_knot_extend_px * lerp(0.2, 1.0, growth),
+    )
+    return SylContext(line=ctx.line, syl=ctx.syl, seed=ctx.seed, config=scaled_config)
 
 
 def _build_ribbon_path(points: list[CenterPoint], ctx: SylContext) -> RibbonPath | None:
@@ -1271,6 +1373,7 @@ def _append_layered_drawings(
     style_name: str,
     start_time: float,
     end_time: float,
+    extra_tags_builder: Callable[[LayerShape], str] | None = None,
 ) -> None:
     """Append stroke drawings for every material layer."""
 
@@ -1291,6 +1394,7 @@ def _append_layered_drawings(
                         color=layer.color,
                         alpha=layer.alpha,
                         blur=layer.blur,
+                        extra_tags="" if extra_tags_builder is None else extra_tags_builder(layer),
                     ),
                 )
             )
@@ -1344,24 +1448,67 @@ def _build_full_shape_events(
     style_name: str,
     config: MeltConfig,
 ) -> list[OutputEvent]:
-    """Build a short establishing stroke event before mask slicing takes over."""
+    """Build a rapid left-to-right lead-in for the main stroke."""
 
     ctx = _build_syl_context(line, syl, config)
     syl_start_abs = _syl_time_to_absolute(line, syl.start_time)
-    syl_end_abs = _syl_time_to_absolute(line, syl.end_time)
-    start_time = _round_ms(syl_start_abs)
-    end_time = _round_ms(min(syl_end_abs, start_time + max(config.min_slice_ms, config.line_fade_in_ms)))
-    if end_time <= start_time:
+    lead_start = _round_ms(max(0.0, syl_start_abs - config.line_lead_in_ms))
+    lead_end = _round_ms(syl_start_abs)
+    if lead_end <= lead_start:
         return []
 
-    return _build_static_stroke_events(
-        ctx=ctx,
-        layers=layers,
-        line_layer_base=line_layer_base,
-        style_name=style_name,
-        start_time=start_time,
-        end_time=end_time,
-    )
+    base_points = _sample_centerline(ctx)
+    if len(base_points) < 2:
+        return []
+
+    main_left = base_points[0].x
+    main_right = base_points[-1].x
+    main_span = max(1.0, main_right - main_left)
+    knot_span = _estimate_right_knot_length_px(ctx)
+    total_span = main_span + knot_span
+    step_ms = _slice_step_ms(config)
+    slice_count = min(MAX_RENDER_SLICES, max(1, math.ceil(max(1.0, lead_end - lead_start) / step_ms)))
+    events: list[OutputEvent] = []
+
+    for frame_index in range(slice_count):
+        start_time = _round_ms(lead_start + frame_index * step_ms)
+        end_time = lead_end if frame_index == slice_count - 1 else _round_ms(min(lead_end, start_time + step_ms))
+        if end_time <= start_time:
+            continue
+
+        u = (frame_index + 1) / slice_count
+        growth = smoothstep(0.0, 1.0, u)
+        scaled_ctx = _scaled_syl_context(ctx, growth=growth)
+        scaled_base_points = _sample_centerline(scaled_ctx)
+        if len(scaled_base_points) < 2:
+            continue
+        perturbed = _perturb_centerline(scaled_base_points, scaled_ctx, start_time, frame_index)
+        progressed = total_span * growth
+        main_visible = min(main_span, progressed)
+        if main_visible <= FLOAT_EPSILON:
+            continue
+        front_x = main_left + main_visible
+        clipped = _clip_centerline_left(perturbed, front_x)
+        ribbon = _build_ribbon_path(clipped, scaled_ctx) if len(clipped) >= 2 else None
+        drawing = _ribbon_to_drawing(ribbon) if ribbon is not None else ""
+
+        knot_visible = max(0.0, progressed - main_span)
+        knot_drawings = _build_right_knot_drawings(perturbed, scaled_ctx, visible_px=knot_visible)
+        if not drawing and not knot_drawings:
+            continue
+
+        _append_layered_drawings(
+            events,
+            drawing=drawing,
+            extra_drawings=knot_drawings,
+            layers=layers,
+            line_layer_base=line_layer_base,
+            style_name=style_name,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+    return events
 
 
 def _build_vector_mask_events(
@@ -1408,7 +1555,14 @@ def _build_vector_mask_events(
     sparks = _build_spark_cluster(ctx, base_points[0].x, base_points[0].y)
     follow_x = base_points[0].x
     follow_y = base_points[0].y
-    events: list[OutputEvent] = []
+    events = _build_full_shape_events(
+        line=line,
+        syl=syl,
+        layers=layers,
+        line_layer_base=line_layer_base,
+        style_name=style_name,
+        config=config,
+    )
     main_seam_trim_px = max(0.75, config.line_width_px * 0.35)
     spark_prefade_start = syl_end_abs - config.spark_prefade_lead_ms
     spark_prefade_ms = max(1.0, config.spark_prefade_lead_ms)
@@ -1463,7 +1617,15 @@ def _build_vector_mask_events(
                 1.0,
             )
             knot_fade_progress = clamp(knot_consume / spark_tail_fade_ms, 0.0, 1.0)
-            spark_alpha = _alpha_lerp(config.spark_alpha, max(time_fade_progress, knot_fade_progress))
+            intro_fade_progress = 1.0 - clamp(
+                (start_time - syl_start_abs) / max(1.0, config.line_fade_in_ms),
+                0.0,
+                1.0,
+            )
+            spark_alpha = _alpha_lerp(
+                config.spark_alpha,
+                max(time_fade_progress, knot_fade_progress, intro_fade_progress),
+            )
             if spark_alpha == "&HFF&":
                 continue
             events.append(
@@ -1937,6 +2099,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--style-name", default="p", help="Generated effect style name.")
     parser.add_argument("--keep-original", type=_parse_bool_arg, default=True, help="Keep original dialogue lines.")
     parser.add_argument("--extended", type=_parse_bool_arg, default=True, help="Whether Ass should compute extended line data.")
+    parser.add_argument(
+        "--effect-mode",
+        choices=("combined", "melt", "word"),
+        default="combined",
+        help="Select the rendering pipeline.",
+    )
+    parser.add_argument(
+        "--word-root",
+        default=os.path.join(os.path.dirname(__file__), "word"),
+        help="Word effect asset root path.",
+    )
 
     for config_field in fields(MeltConfig):
         parser.add_argument(
@@ -1982,6 +2155,8 @@ def render_spike(
     style_name: str = "p",
     keep_original: bool = True,
     extended: bool = True,
+    effect_mode: str = "melt",
+    word_root: str | None = None,
 ) -> str:
     """Render the redline effect and save the ASS output."""
 
@@ -2003,6 +2178,23 @@ def render_spike(
         return io.path_output
 
     collision_offsets = _compute_collision_offsets(target_lines)
+
+    if effect_mode in {"word", "combined"}:
+        bridge = create_word_fx_bridge(
+            word_root=word_root or os.path.join(os.path.dirname(__file__), "word"),
+            layers_per_line=LAYERS_PER_LINE,
+        )
+        bridge.render_target_lines(
+            io,
+            target_lines,
+            line_preparer=lambda line, _line_index: shift_word_fx_line(
+                line,
+                collision_offsets.get(line.i, 0.0),
+            ),
+        )
+        if effect_mode == "word":
+            io.save()
+            return io.path_output
 
     work_items = [
         (
@@ -2044,6 +2236,8 @@ def main(argv: Sequence[str] | None = None) -> str:
         style_name=args.style_name,
         keep_original=args.keep_original,
         extended=args.extended,
+        effect_mode=args.effect_mode,
+        word_root=args.word_root,
     )
 
 
