@@ -174,18 +174,35 @@ def emit_final_text_event(
     char: Any,
     timeline,
     *,
+    config: WordFxConfig,
     options: WordFxRenderOptions,
 ) -> None:
-    fade_in = min(180, max(60, timeline.final_end_ms - timeline.final_start_ms))
+    char_time = getattr(char, "start_time", 0)
+    if char_time < getattr(line, "start_time", 0):
+        char_time += getattr(line, "start_time", 0)
+
+    desired_fade_start = int(round(char_time + config.text_fade_offset_ms))
+    event_start_ms = max(0, timeline.final_start_ms)
+    fade_in = min(max(1, config.text_fade_in_ms), max(1, timeline.final_end_ms - event_start_ms))
+
+    earliest_fade_start = event_start_ms + fade_in + max(0, config.text_min_visible_hold_ms)
+    fade_start = min(
+        max(earliest_fade_start, min(timeline.final_end_ms, desired_fade_start)),
+        max(event_start_ms + fade_in + 1, timeline.final_end_ms - 1),
+    )
+    fade_end = min(timeline.final_end_ms, fade_start + max(1, config.text_fade_ms))
+    fade_start_rel = max(0, fade_start - event_start_ms)
+    fade_end_rel = max(fade_start_rel + 1, fade_end - event_start_ms)
     tags = (
         f"\\an5\\pos({char.center:.2f},{char.middle:.2f})\\alpha&HFF&"
         f"\\t(0,{fade_in},\\alpha&H00&)"
+        f"\\t({fade_start_rel},{fade_end_rel},\\alpha&HFF&)"
     )
     write_event(
         io,
         line,
         layer=_final_layer(options),
-        start_ms=timeline.final_start_ms,
+        start_ms=event_start_ms,
         end_ms=timeline.final_end_ms,
         text=f"{{{tags}}}{char.text}",
     )
@@ -253,7 +270,14 @@ def render_word_effect(
         else:
             emit_whole_char_event(io, line, char, timeline, config=config, options=options)
         emit_highlight_event(io, line, char, timeline, options=options)
-        emit_final_text_event(io, line, char, timeline, options=options)
+        emit_final_text_event(
+            io,
+            line,
+            char,
+            timeline,
+            config=config,
+            options=options,
+        )
         line_debug["chars"].append(
             {
                 "char": char.text,

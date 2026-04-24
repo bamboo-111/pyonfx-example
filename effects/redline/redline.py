@@ -12,7 +12,7 @@ from dataclasses import dataclass, fields, replace
 from types import SimpleNamespace
 
 from pyonfx import Ass, Line, Utils
-from word.word_fx_adapter import create_word_fx_bridge, shift_word_fx_line
+from word.word_fx_adapter import WordFxConfig, create_word_fx_bridge, shift_word_fx_line
 
 
 LAYERS_PER_LINE = 5
@@ -28,6 +28,11 @@ class MeltConfig:
     line_pop_ms: int = 140
     line_long_hold_threshold_ms: int = 240
     line_long_hold_tail_ms: int = 520
+    word_text_fade_in_ms: int = 160
+    word_text_min_visible_hold_ms: int = 180
+    word_text_fade_offset_ms: int = 80
+    word_text_fade_ms: int = 180
+    word_line_entry_start_advance_ms: int = 900
 
     enable_multiprocessing: bool = True
     multiprocessing_min_lines: int = 6
@@ -2185,6 +2190,13 @@ def render_spike(
     if effect_mode in {"word", "combined"}:
         bridge = create_word_fx_bridge(
             word_root=word_root or os.path.join(os.path.dirname(__file__), "word"),
+            config=WordFxConfig(
+                text_fade_in_ms=config.word_text_fade_in_ms,
+                text_min_visible_hold_ms=config.word_text_min_visible_hold_ms,
+                text_fade_offset_ms=config.word_text_fade_offset_ms,
+                text_fade_ms=config.word_text_fade_ms,
+                line_entry_start_advance_ms=config.word_line_entry_start_advance_ms,
+            ),
             layers_per_line=LAYERS_PER_LINE,
         )
         bridge.render_target_lines(

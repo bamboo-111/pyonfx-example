@@ -112,13 +112,14 @@ def build_char_timeline(
     config: WordFxConfig,
 ) -> CharTimeline:
     line_duration = line_end - line_start
+    entry_line_start = max(0, line_start - max(0, config.line_entry_start_advance_ms))
     effective_units = max(1, motion_units)
     timing_scale = config.line_stroke_timing_scale[min(line_index, len(config.line_stroke_timing_scale) - 1)]
     base_animation_ms = int(max(180, effective_units * 48 + 80) * timing_scale)
     available_span = max(600, int(line_duration * 0.8))
     max_step = available_span if char_count <= 1 else max(config.char_entry_step_ms, available_span // char_count)
     step = min(config.char_entry_step_ms, max_step)
-    line_entry_start = max(0, line_start - config.line_entry_lead_in_ms)
+    line_entry_start = max(0, entry_line_start - config.line_entry_lead_in_ms)
     char_start = min(line_end - 280, line_entry_start + char_index * step)
 
     if asset.mode == "full_stroke":
